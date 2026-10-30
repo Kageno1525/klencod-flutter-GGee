@@ -6,9 +6,18 @@ import '../gge_client.dart';
 import '../models.dart';
 
 // ═══════════════════════════════════════════════════
-//  ثوابت
+//  ⚠️ أنواع المعسكرات الحقيقية vs قلاع الدايميو
 // ═══════════════════════════════════════════════════
-const Set<int> kSamuraiCampTypes = {29, 37, 38};
+
+/// Type 29 = Samurai Camp (NPC حقيقي - نهجم عليه)
+const int kSamuraiCampType = 29;
+
+/// Type 37, 38 = Daimyo Castle (قلعة لاعب - مش نهجم عليها افتراضيًا)
+const Set<int> kDaimyoCastleTypes = {37, 38};
+
+/// كل الأنواع اللي بتظهر في المسح (للتصنيف)
+const Set<int> kAllSamuraiTypes = {29, 37, 38};
+
 const int kSamuraiChunkSize = 13;
 const int kSamuraiRadiusMin = 10;
 const int kSamuraiRadiusMax = 100;
@@ -16,13 +25,16 @@ const int kSamuraiRadiusStep = 10;
 const int kSamuraiDefaultRadius = 30;
 const int kSamuraiDefaultCooldownMin = 5;
 
-const Set<int> kDefensiveUnitWodIds = {
-  1, 2, 3, 4, 5, 6, 7, 8, 9,
-};
+/// وحدات دفاعية (Militia) - مش هجومية
+const Set<int> kDefensiveUnitWodIds = {1, 2, 3, 4, 5, 6, 7, 8};
 
 const int kSafeMaxFlankUnits = 42;
 const int kSafeMaxMiddleUnits = 124;
 
+/// فرق level مسموح
+const int kMaxLevelDiff = 15;
+
+// ═══════════════════════════════════════════════════
 class SamuraiMath {
   static int maxAttackers(int lvl) {
     if (lvl <= 69) {
@@ -55,14 +67,13 @@ class SamuraiMath {
 }
 
 // ═══════════════════════════════════════════════════
-//  إعدادات أمر الهجوم (تم إصلاح copyWith)
-// ═══════════════════════════════════════════════════
 class SamuraiAttackConfig {
   final int waves;
   final int? toolId;
   final int toolL;
   final int toolR;
   final int toolM;
+  final bool attackDaimyoCastles;  // ✅ جديد
 
   const SamuraiAttackConfig({
     this.waves = 3,
@@ -70,6 +81,7 @@ class SamuraiAttackConfig {
     this.toolL = 20,
     this.toolR = 20,
     this.toolM = 30,
+    this.attackDaimyoCastles = false,  // ✅ default OFF
   });
 
   bool get useTools =>
@@ -79,18 +91,20 @@ class SamuraiAttackConfig {
 
   SamuraiAttackConfig copyWith({
     int? waves, int? toolId, int? toolL, int? toolR, int? toolM,
-    bool clearToolId = false,
+    bool? attackDaimyoCastles, bool clearToolId = false,
   }) => SamuraiAttackConfig(
         waves: waves ?? this.waves,
         toolId: clearToolId ? null : (toolId ?? this.toolId),
         toolL: toolL ?? this.toolL,
         toolR: toolR ?? this.toolR,
         toolM: toolM ?? this.toolM,
+        attackDaimyoCastles: attackDaimyoCastles ?? this.attackDaimyoCastles,
       );
 
   SamuraiAttackConfig withoutTools() => SamuraiAttackConfig(
         waves: waves, toolId: null,
         toolL: toolL, toolR: toolR, toolM: toolM,
+        attackDaimyoCastles: attackDaimyoCastles,
       );
 }
 
@@ -120,17 +134,18 @@ class SamuraiCamp {
     this.lastAttackAt, this.lastAttackMid,
   });
 
-  String get typeName => switch (type) {
-        29 => 'Samurai Camp',
-        37 => 'Samurai I',
-        38 => 'Samurai II',
-        _ => 'Camp $type',
-      };
+  bool get isDaimyoCastle => kDaimyoCastleTypes.contains(type);
+
+  String get typeName {
+    if (type == kSamuraiCampType) return 'Samurai Camp';
+    if (type == 37) return 'Daimyo Lv1';
+    if (type == 38) return 'Daimyo Lv2';
+    return 'Camp $type';
+  }
 
   String get coordsLabel => '($x,$y)';
   String get key => '$x,$y,$kid';
-  bool get isDead => type != 29 && hp <= 0;
-  bool get isPlayerCamp => ownerId != -1;
+  bool get isDead => type != kSamuraiCampType && hp <= 0;
 
   SamuraiCamp copyWith({
     int? hp, int? level, int? level2,
@@ -159,30 +174,37 @@ class SamuraiAttackResult {
   final int toolsUsed;
   final bool usedTools;
   final int lordIdUsed;
+  final int attemptsMade;
 
   SamuraiAttackResult._({
     required this.success, this.error, this.movementId,
     this.target, this.totalUnits = 0, this.wavesSent = 0,
-    this.toolsUsed = 0, this.usedTools = false, this.lordIdUsed = 0,
+    this.toolsUsed = 0, this.usedTools = false,
+    this.lordIdUsed = 0, this.attemptsMade = 0,
   });
 
   factory SamuraiAttackResult.ok({
     required int mid, required SamuraiCamp t,
     required int units, required int waves,
-    required int tools, required bool usedTools, int lordIdUsed = 0,
+    required int tools, required bool usedTools,
+    int lordIdUsed = 0, int attemptsMade = 0,
   }) => SamuraiAttackResult._(
         success: true, movementId: mid, target: t,
         totalUnits: units, wavesSent: waves,
-        toolsUsed: tools, usedTools: usedTools, lordIdUsed: lordIdUsed,
+        toolsUsed: tools, usedTools: usedTools,
+        lordIdUsed: lordIdUsed, attemptsMade: attemptsMade,
       );
 
-  factory SamuraiAttackResult.fail(String err) =>
-      SamuraiAttackResult._(success: false, error: err);
+  factory SamuraiAttackResult.fail(String err, {int attempts = 0}) =>
+      SamuraiAttackResult._(
+        success: false, error: err, attemptsMade: attempts);
 
-  SamuraiAttackResult copyWithLordId(int lid) => SamuraiAttackResult._(
+  SamuraiAttackResult copyWithLordId(int lid, {int attempts = 0}) =>
+      SamuraiAttackResult._(
         success: success, error: error, movementId: movementId,
         target: target, totalUnits: totalUnits, wavesSent: wavesSent,
-        toolsUsed: toolsUsed, usedTools: usedTools, lordIdUsed: lid,
+        toolsUsed: toolsUsed, usedTools: usedTools,
+        lordIdUsed: lid, attemptsMade: attempts,
       );
 }
 
@@ -192,18 +214,21 @@ class SamuraiSettings {
   int sourceAreaId;
   int maxLevel;
   bool skipPlayerCamps;
+  bool includeDaimyoInScan;
 
   SamuraiSettings({
     this.radiusTiles = kSamuraiDefaultRadius,
     this.sourceAreaId = 0,
     this.maxLevel = 100,
     this.skipPlayerCamps = true,
+    this.includeDaimyoInScan = false,  // ✅ default: مش بنعرضهم
   });
 
   static const _kRadius = 'samurai_radius_v1';
   static const _kSource = 'samurai_source_v1';
   static const _kMaxLevel = 'samurai_max_level_v1';
   static const _kSkipPlayer = 'samurai_skip_player_v1';
+  static const _kIncludeDaimyo = 'samurai_include_daimyo_v1';
 
   static Future<SamuraiSettings> load() async {
     final p = await SharedPreferences.getInstance();
@@ -214,6 +239,7 @@ class SamuraiSettings {
       sourceAreaId: p.getInt(_kSource) ?? 0,
       maxLevel: p.getInt(_kMaxLevel) ?? 100,
       skipPlayerCamps: p.getBool(_kSkipPlayer) ?? true,
+      includeDaimyoInScan: p.getBool(_kIncludeDaimyo) ?? false,
     );
   }
 
@@ -223,6 +249,7 @@ class SamuraiSettings {
     await p.setInt(_kSource, sourceAreaId);
     await p.setInt(_kMaxLevel, maxLevel);
     await p.setBool(_kSkipPlayer, skipPlayerCamps);
+    await p.setBool(_kIncludeDaimyo, includeDaimyoInScan);
   }
 }
 
@@ -238,6 +265,9 @@ class SamuraiService {
   final Map<String, DateTime> _cooldowns = {};
   static const _kCooldowns = 'samurai_cooldowns_v1';
   final Map<String, DateTime> _activeCamps = {};
+
+  int? _playerLevel;
+  int? get playerLevel => _playerLevel;
 
   Future<void> loadCooldowns() async {
     final p = await SharedPreferences.getInstance();
@@ -303,10 +333,28 @@ class SamuraiService {
         _lastJcaAt != null &&
         DateTime.now().difference(_lastJcaAt!).inMinutes < 5) return;
     try {
-      await conn.sendXtAndWait('jca', jsonEncode({'CID': -1, 'KID': kid}),
+      final resp = await conn.sendXtAndWait(
+          'jca', jsonEncode({'CID': -1, 'KID': kid}),
           responseCmd: 'jaa', timeoutMs: 8000, isAction: false);
       _currentKid = kid;
       _lastJcaAt = DateTime.now();
+
+      if (resp.payload != null) {
+        try {
+          final data = jsonDecode(resp.payload!) as Map<String, dynamic>;
+          final gca = data['gca'] as Map?;
+          final o = gca?['O'] as Map?;
+          if (o != null) {
+            final lvl = _asIntOrNull(o['L']);
+            final ll = _asIntOrNull(o['LL']) ?? 0;
+            if (lvl != null) {
+              _playerLevel = lvl + ll;
+              TrafficLog.add('ST',
+                  '[Samurai] 👤 Player level: $_playerLevel');
+            }
+          }
+        } catch (_) {}
+      }
     } catch (_) {}
   }
 
@@ -315,6 +363,7 @@ class SamuraiService {
     required int radiusTiles,
     int maxLevel = 100,
     bool skipPlayerCamps = true,
+    bool includeDaimyo = false,  // ✅ جديد
     void Function(int done, int total)? onProgress,
   }) async {
     if (_lastScanAt != null &&
@@ -350,6 +399,7 @@ class SamuraiService {
     final found = <SamuraiCamp>[];
     final seen = <String>{};
     int done = 0;
+    int skippedDaimyo = 0;
 
     for (final chunk in chunks) {
       try {
@@ -370,7 +420,13 @@ class SamuraiService {
             for (final entry in ai) {
               if (entry is! List || entry.length < 3) continue;
               final type = _asInt(entry[0]);
-              if (!kSamuraiCampTypes.contains(type)) continue;
+              if (!kAllSamuraiTypes.contains(type)) continue;
+
+              // ✅ فصل قلاع الدايميو
+              if (kDaimyoCastleTypes.contains(type) && !includeDaimyo) {
+                skippedDaimyo++;
+                continue;
+              }
 
               final x = _asInt(entry[1]);
               final y = _asInt(entry[2]);
@@ -380,12 +436,13 @@ class SamuraiService {
               final ownerId = _asInt(entry[3], -1);
               int hp = 0, level = 0, level2 = 0, campId = 0;
 
-              if (type == 29) {
+              if (type == kSamuraiCampType) {
                 if (entry.length > 8) campId = _asInt(entry[8]);
                 if (entry.length > 9) level = _asInt(entry[9]);
                 if (entry.length > 10) level2 = _asInt(entry[10]);
                 if (level <= 0 && level2 > 0) level = level2;
               } else {
+                // Daimyo castles (37, 38)
                 if (entry.length > 8) hp = _asInt(entry[8]);
                 if (entry.length > 9) level = _asInt(entry[9]);
                 if (entry.length > 10) level2 = _asInt(entry[10]);
@@ -394,14 +451,10 @@ class SamuraiService {
 
               if (skipPlayerCamps && ownerId != -1) {
                 TrafficLog.add('ST',
-                    '[Samurai] ⏭️ Skip player camp at ($x,$y) ownerId=$ownerId');
+                    '[Samurai] ⏭️ Skip player camp ($x,$y)');
                 continue;
               }
-              if (maxLevel > 0 && level > maxLevel) {
-                TrafficLog.add('ST',
-                    '[Samurai] ⏭️ Skip high-level camp ($x,$y) Lv$level > max$maxLevel');
-                continue;
-              }
+              if (maxLevel > 0 && level > maxLevel) continue;
 
               seen.add(key);
               final dx = (x - cx).toDouble();
@@ -426,6 +479,13 @@ class SamuraiService {
             Duration(milliseconds: 800 + Random().nextInt(400)));
       }
     }
+
+    if (skippedDaimyo > 0) {
+      TrafficLog.add('ST',
+          '[Samurai] 🛡️ Skipped $skippedDaimyo Daimyo Castles (types 37/38)');
+    }
+    TrafficLog.add('ST',
+        '[Samurai] ✅ Found ${found.length} real Samurai Camps (type 29)');
     return found;
   }
 
@@ -439,9 +499,26 @@ class SamuraiService {
     List<Lord>? fallbackLords,
     bool markCooldownAfterSuccess = true,
   }) async {
+    // ✅ رفض قلاع الدايميو إلا لو config.attackDaimyoCastles == true
+    if (camp.isDaimyoCastle && !config.attackDaimyoCastles) {
+      TrafficLog.add('ST',
+          '[Samurai] 🛡️ Rejecting attack on Daimyo Castle ${camp.coordsLabel}');
+      return SamuraiAttackResult.fail(
+          'DAIMYO_CASTLE_SKIP: (${camp.coordsLabel}) is a player Daimyo castle — not attacking');
+    }
+
     if (isCampUnderAttack(camp)) {
       return SamuraiAttackResult.fail(
           'CAMP_UNDER_ATTACK: فيه هجوم شغال على (${camp.coordsLabel})');
+    }
+
+    final targetLvl = manualLevel ?? (camp.level > 0 ? camp.level : camp.level2);
+    if (targetLvl > 0 && _playerLevel != null) {
+      final diff = targetLvl - _playerLevel!;
+      if (diff > kMaxLevelDiff) {
+        return SamuraiAttackResult.fail(
+            'TARGET_TOO_HIGH: Lv$targetLvl (فرق $diff > $kMaxLevelDiff)');
+      }
     }
 
     final lordsToTry = <int>[lordId];
@@ -454,10 +531,13 @@ class SamuraiService {
     }
 
     SamuraiAttackResult? lastResult;
+    int consecutiveCRA6 = 0;
+    int attempts = 0;
 
     for (final lid in lordsToTry) {
+      attempts++;
       TrafficLog.add('ST',
-          '[Samurai] ⚔️ Try Lord $lid on ${camp.coordsLabel}');
+          '[Samurai] ⚔️ Try Lord $lid on ${camp.coordsLabel} (attempt $attempts/${lordsToTry.length})');
 
       var result = await _tryAttack(
         camp: camp, source: source, lordId: lid,
@@ -467,12 +547,27 @@ class SamuraiService {
 
       if (result.success) {
         if (markCooldownAfterSuccess) await markCampAttacked(camp);
-        return result.copyWithLordId(lid);
+        return result.copyWithLordId(lid, attempts: attempts);
       }
 
-      if (result.error == 'CRA 313' || result.error == 'TOO_MANY_UNITS_313') {
+      // ✅ CRA 6 = target rejected by server → give up after 2
+      if (result.error == 'CRA 6') {
+        consecutiveCRA6++;
         TrafficLog.add('ST',
-            '[Samurai] ⚠️ 313 → retry 1 wave · 70% units · same tools');
+            '[Samurai] 🚫 CRA 6 (target unavailable) — streak: $consecutiveCRA6');
+        if (consecutiveCRA6 >= 2) {
+          TrafficLog.add('ER',
+              '[Samurai] ❌ Target ${camp.coordsLabel} rejected by server — giving up');
+          return SamuraiAttackResult.fail(
+              'TARGET_REJECTED: (${camp.coordsLabel}) Lv$targetLvl — server refused',
+              attempts: attempts);
+        }
+      } else {
+        consecutiveCRA6 = 0;
+      }
+
+      // retry 313
+      if (result.error == 'CRA 313' || result.error == 'TOO_MANY_UNITS_313') {
         result = await _tryAttack(
           camp: camp, source: source, lordId: lid,
           availableUnits: availableUnits,
@@ -481,15 +576,17 @@ class SamuraiService {
         );
         if (result.success) {
           if (markCooldownAfterSuccess) await markCampAttacked(camp);
-          return result.copyWithLordId(lid);
+          return result.copyWithLordId(lid, attempts: attempts);
+        }
+        if (result.error == 'CRA 6') {
+          consecutiveCRA6++;
+          if (consecutiveCRA6 >= 2) break;
         }
       }
 
       if (config.useTools && (result.error?.contains('313') == true ||
           result.error == 'CRA 100' ||
           result.error == 'UNIT_NOT_SENDABLE_91')) {
-        TrafficLog.add('ST',
-            '[Samurai] ⚠️ retry 1 wave · 70% units · WITHOUT tools');
         result = await _tryAttack(
           camp: camp, source: source, lordId: lid,
           availableUnits: availableUnits,
@@ -498,7 +595,7 @@ class SamuraiService {
         );
         if (result.success) {
           if (markCooldownAfterSuccess) await markCampAttacked(camp);
-          return result.copyWithLordId(lid);
+          return result.copyWithLordId(lid, attempts: attempts);
         }
       }
 
@@ -510,11 +607,10 @@ class SamuraiService {
           err.contains('CRA 6') ||
           err.contains('404');
       if (!isLordIssue) break;
-      TrafficLog.add('ST',
-          '[Samurai] 🔄 Lord $lid failed ($err) → try next lord');
     }
 
-    return lastResult ?? SamuraiAttackResult.fail('ALL_ATTEMPTS_FAILED');
+    return lastResult ??
+        SamuraiAttackResult.fail('ALL_ATTEMPTS_FAILED', attempts: attempts);
   }
 
   Future<SamuraiAttackResult> _tryAttack({
@@ -528,8 +624,7 @@ class SamuraiService {
   }) async {
     final lvl = manualLevel ?? (camp.level > 0 ? camp.level : camp.level2);
     if (lvl <= 0) {
-      return SamuraiAttackResult.fail(
-          'LEVEL_UNKNOWN: محتاج تحدد level المعسكر يدويًا');
+      return SamuraiAttackResult.fail('LEVEL_UNKNOWN');
     }
 
     final rawFlank = SamuraiMath.flankMax(lvl);
@@ -543,8 +638,7 @@ class SamuraiService {
         .where((u) => u.amount > 0 && _isOffensiveUnit(u))
         .toList();
     if (combat.isEmpty) {
-      return SamuraiAttackResult.fail(
-          'NO_OFFENSIVE_UNITS: مفيش وحدات هجومية في القلعة');
+      return SamuraiAttackResult.fail('NO_OFFENSIVE_UNITS');
     }
 
     final melee = combat.where((u) {
@@ -619,8 +713,7 @@ class SamuraiService {
       }
     }
     if (usedIds.length > 10) {
-      return SamuraiAttackResult.fail(
-          'TOO_MANY_UNIT_TYPES (${usedIds.length} > 10)');
+      return SamuraiAttackResult.fail('TOO_MANY_UNIT_TYPES');
     }
 
     final payload = {

@@ -115,6 +115,7 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
         radiusTiles: _settings.radiusTiles,
         maxLevel: _settings.maxLevel,
         skipPlayerCamps: _settings.skipPlayerCamps,
+        includeDaimyo: _settings.includeDaimyoInScan,
         onProgress: (d, t) {
           if (!mounted) return;
           setState(() {
@@ -173,7 +174,7 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
               ],
             ),
           ),
-          if (_source != null)
+          if (_source != null && !_loading)
             Positioned(
               left: 16,
               right: 16,
@@ -314,8 +315,11 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
   Widget _filterBar() {
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
-      child: Row(
+      child: Wrap(
+        spacing: 8,
+        runSpacing: 6,
         children: [
+          // Radius chip
           GestureDetector(
             onTap: _openRadiusDialog,
             child: Container(
@@ -340,7 +344,7 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
               ]),
             ),
           ),
-          const SizedBox(width: 8),
+          // Max level chip
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
             decoration: BoxDecoration(
@@ -355,6 +359,44 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
               Text('Lv ≤ ${_settings.maxLevel}',
                   style: const TextStyle(
                       color: Colors.white70,
+                      fontSize: 11,
+                      fontWeight: FontWeight.bold,
+                      decoration: TextDecoration.none)),
+            ]),
+          ),
+          // ✅ Daimyo status badge
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            decoration: BoxDecoration(
+              color: (_settings.includeDaimyoInScan
+                      ? Colors.orange
+                      : Colors.green)
+                  .withOpacity(0.15),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(
+                  color: (_settings.includeDaimyoInScan
+                          ? Colors.orange
+                          : Colors.green)
+                      .withOpacity(0.4)),
+            ),
+            child: Row(mainAxisSize: MainAxisSize.min, children: [
+              Icon(
+                  _settings.includeDaimyoInScan
+                      ? Icons.warning_amber_rounded
+                      : Icons.shield_rounded,
+                  color: _settings.includeDaimyoInScan
+                      ? Colors.orange
+                      : Colors.green,
+                  size: 14),
+              const SizedBox(width: 4),
+              Text(
+                  _settings.includeDaimyoInScan
+                      ? 'مع Daimyo'
+                      : 'بدون Daimyo',
+                  style: TextStyle(
+                      color: _settings.includeDaimyoInScan
+                          ? Colors.orange
+                          : Colors.green,
                       fontSize: 11,
                       fontWeight: FontWeight.bold,
                       decoration: TextDecoration.none)),
@@ -421,10 +463,13 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
     final underAttack = _svc.isCampUnderAttack(c);
     final cd = _svc.campCooldownRemaining(c);
     final dead = c.isDead;
+    final isDaimyo = c.isDaimyoCastle;
 
+    // ✅ الـ Daimyo castles بيبانوا بلون برتقالي
+    final primaryColor = isDaimyo ? Colors.orange : kSamuraiRed;
     final borderColor = dead
         ? Colors.grey
-        : (inCooldown || underAttack ? Colors.orange : kSamuraiRed);
+        : (inCooldown || underAttack ? Colors.orange : primaryColor);
 
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
@@ -450,21 +495,23 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
                             ? Colors.grey
                             : (inCooldown || underAttack)
                                 ? Colors.orange
-                                : kSamuraiRed)
+                                : primaryColor)
                         .withOpacity(0.15),
                     borderRadius: BorderRadius.circular(12),
                   ),
                   child: Icon(
-                      dead
-                          ? Icons.dangerous_rounded
-                          : (inCooldown || underAttack)
-                              ? Icons.hourglass_top_rounded
-                              : Icons.shield_rounded,
+                      isDaimyo
+                          ? Icons.account_balance_rounded
+                          : (dead
+                              ? Icons.dangerous_rounded
+                              : (inCooldown || underAttack)
+                                  ? Icons.hourglass_top_rounded
+                                  : Icons.shield_rounded),
                       color: dead
                           ? Colors.grey
                           : (inCooldown || underAttack)
                               ? Colors.orange
-                              : kSamuraiRed,
+                              : primaryColor,
                       size: 22),
                 ),
                 const SizedBox(width: 12),
@@ -480,7 +527,9 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
                                 fontSize: 15,
                                 decoration: TextDecoration.none)),
                         const SizedBox(width: 8),
-                        if (dead)
+                        if (isDaimyo)
+                          _pill('Daimyo', Colors.orange)
+                        else if (dead)
                           _pill('مدمر', Colors.grey)
                         else if (underAttack)
                           _pill('هجوم شغال', Colors.orange)
@@ -488,14 +537,15 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
                           _pill(
                               '${cd.inMinutes}:${(cd.inSeconds % 60).toString().padLeft(2, "0")}',
                               Colors.orange)
-                        else if (c.type != 29)
+                        else if (c.type != kSamuraiCampType)
                           _pill('HP ${c.hp}', kSamuraiRed)
                         else if (c.level <= 0)
                           _pill('Lv ؟', Colors.amber),
                       ]),
                       const SizedBox(height: 4),
                       Row(children: [
-                        Text('${c.typeName} · Lv ${c.level > 0 ? c.level : c.level2}',
+                        Text(
+                            '${c.typeName} · Lv ${c.level > 0 ? c.level : c.level2}',
                             style: TextStyle(
                                 color: AppTheme.subTextColor(context),
                                 fontSize: 10.5,
@@ -556,19 +606,27 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
         },
       ),
     );
-    if (result != null && result.success && mounted) {
+
+    if (!mounted) return;
+
+    if (result != null && result.success) {
       setState(() {
         final i = _camps.indexWhere((x) => x.key == c.key);
         if (i >= 0) {
-          _camps[i] = _camps[i].copyWith(
-            lastAttackAt: DateTime.now(),
-          );
+          _camps[i] = _camps[i].copyWith(lastAttackAt: DateTime.now());
         }
       });
       _snack(
         '✅ ${result.wavesSent} waves · ${result.totalUnits} وحدة'
-        '${result.usedTools ? " · ${result.toolsUsed} أداة" : " · بدون أدوات"}',
+        '${result.usedTools ? " · ${result.toolsUsed} أداة" : " · بدون أدوات"}'
+        '${result.attemptsMade > 1 ? " (${result.attemptsMade} محاولات)" : ""}',
         color: AppTheme.green,
+      );
+    } else if (result != null && !result.success) {
+      _snack(
+        '❌ ${result.error ?? "فشل"}'
+        '${result.attemptsMade > 0 ? " (${result.attemptsMade} محاولات)" : ""}',
+        color: AppTheme.red,
       );
     }
   }
@@ -625,6 +683,8 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
   void _openFilterDialog() {
     int maxLevel = _settings.maxLevel;
     bool skipPlayer = _settings.skipPlayerCamps;
+    bool includeDaimyo = _settings.includeDaimyoInScan;
+
     showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
@@ -632,49 +692,70 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
           backgroundColor: Theme.of(ctx).colorScheme.surface,
           title: const Text('فلاتر المسح',
               style: TextStyle(decoration: TextDecoration.none)),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Row(children: [
-                const Text('Max Level:',
-                    style: TextStyle(
-                        color: Colors.white70,
-                        fontSize: 13,
-                        decoration: TextDecoration.none)),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Slider(
-                    value: maxLevel.toDouble(),
-                    min: 1, max: 100,
-                    divisions: 99,
-                    activeColor: kSamuraiGold,
-                    label: '$maxLevel',
-                    onChanged: (v) => setSt(() => maxLevel = v.round()),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // Max level
+                Row(children: [
+                  const Text('Max Level:',
+                      style: TextStyle(
+                          color: Colors.white70,
+                          fontSize: 13,
+                          decoration: TextDecoration.none)),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Slider(
+                      value: maxLevel.toDouble(),
+                      min: 1, max: 100,
+                      divisions: 99,
+                      activeColor: kSamuraiGold,
+                      label: '$maxLevel',
+                      onChanged: (v) => setSt(() => maxLevel = v.round()),
+                    ),
                   ),
+                  Text('$maxLevel',
+                      style: const TextStyle(
+                          color: kSamuraiGold,
+                          fontWeight: FontWeight.bold,
+                          decoration: TextDecoration.none)),
+                ]),
+                // Skip player camps
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('تجاهل قلاع اللاعبين',
+                      style: TextStyle(
+                          fontSize: 13,
+                          decoration: TextDecoration.none)),
+                  subtitle: const Text(
+                      'قلاع ملونة (ownerId != -1)',
+                      style: TextStyle(
+                          fontSize: 10,
+                          color: Colors.white54,
+                          decoration: TextDecoration.none)),
+                  value: skipPlayer,
+                  activeColor: kSamuraiGold,
+                  onChanged: (v) => setSt(() => skipPlayer = v),
                 ),
-                Text('$maxLevel',
-                    style: const TextStyle(
-                        color: kSamuraiGold,
-                        fontWeight: FontWeight.bold,
-                        decoration: TextDecoration.none)),
-              ]),
-              SwitchListTile(
-                contentPadding: EdgeInsets.zero,
-                title: const Text('تجاهل قلاع اللاعبين',
-                    style: TextStyle(
-                        fontSize: 13,
-                        decoration: TextDecoration.none)),
-                subtitle: const Text(
-                    'قلاع ملونة (Diamond Castle, إلخ)',
-                    style: TextStyle(
-                        fontSize: 10,
-                        color: Colors.white54,
-                        decoration: TextDecoration.none)),
-                value: skipPlayer,
-                activeColor: kSamuraiGold,
-                onChanged: (v) => setSt(() => skipPlayer = v),
-              ),
-            ],
+                // ✅ Daimyo castles
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('هجوم قلاع الدايميو (37/38)',
+                      style: TextStyle(
+                          fontSize: 13,
+                          decoration: TextDecoration.none)),
+                  subtitle: const Text(
+                      '⚠️ قلاع لاعبين — يفضل OFF',
+                      style: TextStyle(
+                          fontSize: 10,
+                          color: Colors.orange,
+                          decoration: TextDecoration.none)),
+                  value: includeDaimyo,
+                  activeColor: Colors.orange,
+                  onChanged: (v) => setSt(() => includeDaimyo = v),
+                ),
+              ],
+            ),
           ),
           actions: [
             TextButton(
@@ -685,6 +766,7 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
                 setState(() {
                   _settings.maxLevel = maxLevel;
                   _settings.skipPlayerCamps = skipPlayer;
+                  _settings.includeDaimyoInScan = includeDaimyo;
                   _settings.save();
                 });
                 Navigator.pop(ctx);
@@ -698,6 +780,8 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
   }
 }
 
+// ═══════════════════════════════════════════════════════
+//  Attack Sheet
 // ═══════════════════════════════════════════════════════
 class _SamuraiAttackSheet extends StatefulWidget {
   final GgeClient client;
@@ -781,6 +865,13 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
   }
 
   Future<void> _attack() async {
+    // ✅ تحقق من Daimyo
+    if (widget.camp.isDaimyoCastle && !_config.attackDaimyoCastles) {
+      setState(() => _lastError =
+          'هذا Daimyo Castle (لاعب) — مش بنهجم عليه افتراضيًا. افتح الفلاتر لو عايز.');
+      return;
+    }
+
     if (_selectedLord == null) {
       setState(() => _lastError = 'اختر قائد');
       return;
@@ -801,7 +892,6 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
       _lastError = null;
     });
 
-    // ✅ استخراج كل اللوردات المتاحة كـ fallback
     final fallbackLords = _commanders
         .where((c) => !c.isBusy)
         .map((c) => c.lord)
@@ -830,6 +920,8 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
   @override
   Widget build(BuildContext context) {
     final c = widget.camp;
+    final isDaimyo = c.isDaimyoCastle;
+
     return DraggableScrollableSheet(
       initialChildSize: 0.9,
       minChildSize: 0.5,
@@ -854,11 +946,16 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
                 Container(
                   width: 40, height: 40,
                   decoration: BoxDecoration(
-                    gradient: const LinearGradient(
-                        colors: [kSamuraiRed, kSamuraiDark]),
+                    gradient: LinearGradient(
+                        colors: isDaimyo
+                            ? [Colors.orange, Colors.deepOrange]
+                            : [kSamuraiRed, kSamuraiDark]),
                     borderRadius: BorderRadius.circular(10),
                   ),
-                  child: const Icon(Icons.shield_rounded,
+                  child: Icon(
+                      isDaimyo
+                          ? Icons.account_balance_rounded
+                          : Icons.shield_rounded,
                       color: Colors.white, size: 20),
                 ),
                 const SizedBox(width: 10),
@@ -874,7 +971,7 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
                               decoration: TextDecoration.none)),
                       Text(
                           'Lv ${_effectiveLevel}'
-                          '${c.type != 29 ? " · HP ${c.hp}" : ""}'
+                          '${c.type != kSamuraiCampType ? " · HP ${c.hp}" : ""}'
                           ' · ${_totalUnits} وحدة متاحة',
                           style: const TextStyle(
                               color: Colors.white54,
@@ -898,6 +995,7 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
                       padding: const EdgeInsets.fromLTRB(16, 8, 16, 20),
                       children: [
                         if (_lastError != null) _errorBanner(),
+                        if (isDaimyo) _daimyoWarning(),
                         _levelCard(),
                         const SizedBox(height: 12),
                         _lordSection(),
@@ -930,7 +1028,8 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
                             fontSize: 15,
                             decoration: TextDecoration.none)),
                     style: ElevatedButton.styleFrom(
-                      backgroundColor: kSamuraiRed,
+                      backgroundColor:
+                          isDaimyo ? Colors.orange : kSamuraiRed,
                       foregroundColor: Colors.white,
                       shape: RoundedRectangleBorder(
                           borderRadius: BorderRadius.circular(14)),
@@ -970,6 +1069,33 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
           onPressed: () => setState(() => _lastError = null),
           padding: EdgeInsets.zero,
           constraints: const BoxConstraints(),
+        ),
+      ]),
+    );
+  }
+
+  // ✅ تحذير Daimyo
+  Widget _daimyoWarning() {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.orange.withOpacity(0.15),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.orange.withOpacity(0.5)),
+      ),
+      child: Row(children: [
+        const Icon(Icons.warning_amber_rounded,
+            color: Colors.orange, size: 20),
+        const SizedBox(width: 8),
+        const Expanded(
+          child: Text(
+              '⚠️ ده قلعة لاعب (Daimyo) مش NPC. الهجوم عليه ممكن يسبب خسائر بدون فايدة. متأكد؟',
+              style: TextStyle(
+                  color: Colors.orange,
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
+                  decoration: TextDecoration.none)),
         ),
       ]),
     );
@@ -1042,7 +1168,8 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
             ),
             onChanged: (s) {
               final v = int.tryParse(s);
-              setState(() => _manualLevel = (v != null && v > 0) ? v : null);
+              setState(() =>
+                  _manualLevel = (v != null && v > 0) ? v : null);
             },
           ),
         ),
@@ -1139,6 +1266,24 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
                     color: Colors.white38,
                     decoration: TextDecoration.none)),
           ],
+          // ✅ Daimyo toggle
+          if (widget.camp.isDaimyoCastle) ...[
+            const Divider(color: Colors.white12),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('السماح بمهاجمة Daimyo',
+                  style: TextStyle(
+                      fontSize: 12,
+                      color: Colors.orange,
+                      decoration: TextDecoration.none)),
+              value: _config.attackDaimyoCastles,
+              activeColor: Colors.orange,
+              onChanged: (v) => setState(() {
+                _config =
+                    _config.copyWith(attackDaimyoCastles: v);
+              }),
+            ),
+          ],
         ],
       ),
     );
@@ -1203,17 +1348,20 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
                   fontWeight: FontWeight.bold,
                   decoration: TextDecoration.none)),
           const SizedBox(height: 6),
-          Text('• كل wave أقصى: $maxWave وحدة ($maxFlank L + $maxMiddle M + $maxFlank R)',
+          Text(
+              '• كل wave أقصى: $maxWave وحدة ($maxFlank L + $maxMiddle M + $maxFlank R)',
               style: const TextStyle(
                   color: Colors.white70,
                   fontSize: 11,
                   decoration: TextDecoration.none)),
-          Text('• أدوات: أقصى $maxFlankTools للجناح · $maxMiddleTools للأمام',
+          Text(
+              '• أدوات: أقصى $maxFlankTools للجناح · $maxMiddleTools للأمام',
               style: const TextStyle(
                   color: Colors.white70,
                   fontSize: 11,
                   decoration: TextDecoration.none)),
-          Text('• Waves: ${_config.waves} · إجمالي وحدة: $_totalUnits',
+          Text(
+              '• Waves: ${_config.waves} · إجمالي وحدة: $_totalUnits',
               style: const TextStyle(
                   color: Colors.white70,
                   fontSize: 11,
