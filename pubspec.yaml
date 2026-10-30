@@ -1,0 +1,25 @@
+name: gge
+description: A professional bot for Goodgame Empire.
+publish_to: 'none'
+version: 2.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  shared_preferences: ^2.2.2
+  cupertino_icons: ^1.0.6
+  web_socket_channel: ^2.4.0
+  flutter_local_notifications: ^18.0.1
+  timezone: ^0.10.0
+  flutter_foreground_task: ^11.0.3
+  # ═══ NEW ═══
+  android_intent_plus: ^5.2.0
+  device_info_plus: ^11.1.0
+
+flutter:
+  uses-material-design: true
