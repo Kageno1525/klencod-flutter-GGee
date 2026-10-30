@@ -26,7 +26,6 @@ class SamuraiAutoService {
   static const _kMinUnits = 'samurai_auto_min_units';
   static const _kCommanderIds = 'samurai_auto_commander_ids';
   static const _kToolId = 'samurai_auto_tool_id';
-  static const _kFallbackToolId = 'samurai_auto_fallback_tool_id';
   static const _kToolL = 'samurai_auto_tool_l';
   static const _kToolR = 'samurai_auto_tool_r';
   static const _kToolM = 'samurai_auto_tool_m';
@@ -44,7 +43,6 @@ class SamuraiAutoService {
 
   static const int kDefMinUnits = 30;
   static const int kDefToolId = 166;
-  static const int kDefFallbackToolId = 30;  // ✅ الأداة البديلة
   static const int kDefToolL = 20;
   static const int kDefToolR = 20;
   static const int kDefToolM = 30;
@@ -55,8 +53,9 @@ class SamuraiAutoService {
   static const int kDefMaxAttacksDay = 0;
 
   static const int kCampsScanRadius = 30;
-  static const int kCampsScanCacheMin = 5;
+  static const int kCampsScanCacheMin = 5; // ✅ بحث تلقائي كل 5 دقايق
   static const int kFailedCampCooldownMin = 30;
+  // ⚠️ لم يعد مستخدمًا — تم إلغاء الـ success cooldown
   static const int kSuccessCooldownMin = 5;
 
   static const Set<int> kDefensiveWodIds = {1, 2, 3, 4, 5, 6, 7, 8};
@@ -129,15 +128,6 @@ class SamuraiAutoService {
 
   Future<int> getToolId() async =>
       (await SharedPreferences.getInstance()).getInt(_kToolId) ?? kDefToolId;
-
-  Future<int> getFallbackToolId() async =>
-      (await SharedPreferences.getInstance()).getInt(_kFallbackToolId) ??
-      kDefFallbackToolId;
-
-  Future<void> setFallbackToolId(int v) async {
-    final p = await SharedPreferences.getInstance();
-    await p.setInt(_kFallbackToolId, v);
-  }
 
   Future<int> getToolL() async =>
       (await SharedPreferences.getInstance()).getInt(_kToolL) ?? kDefToolL;
@@ -414,13 +404,15 @@ class SamuraiAutoService {
   Future<void> _tryAttackCamps() async {
     if (_client == null || _svc == null) return;
 
+    // سيفتي فقط — مش حد فعلي
+    const int safetyMaxAttacks = 50;
+    const int maxFailStreak = 5;
+
     final p = await SharedPreferences.getInstance();
     final srcArea = p.getInt(_kSourceAreaId) ?? 0;
     if (srcArea == 0) return;
 
     final minUnits = p.getInt(_kMinUnits) ?? kDefMinUnits;
-    final delayMin = p.getInt(_kDelayMin) ?? kDefDelayMin;
-    final delayMax = p.getInt(_kDelayMax) ?? kDefDelayMax;
     final maxAttacksDay = p.getInt(_kMaxAttacksDay) ?? kDefMaxAttacksDay;
     final selectedCmds = await getCommanderIds();
     final skipDaimyo = p.getBool(_kSkipDaimyo) ?? true;
@@ -432,29 +424,38 @@ class SamuraiAutoService {
     }
 
     try {
-      final castles = await _client!.getCastles();
-      OwnedCastle? source;
-      for (final c in castles) {
-        if (c.areaId == srcArea) source = c;
-      }
-      if (source == null) return;
-
-      final catalog = await _client!.loadCatalog();
       int attacksThisTick = 0;
-      int attempts = 0;
-      const int maxAttempts = 5;
+      int failStreak = 0;
+      _attackedThisTick.clear(); // round-robin يبدأ من الأول
 
-      while (_running && attempts < maxAttempts) {
+      while (_running && attacksThisTick < safetyMaxAttacks) {
+        // ─── 🔄 REFRESH ───
+        final castles = await _client!.getCastles();
+        OwnedCastle? source;
+        for (final c in castles) {
+          if (c.areaId == srcArea) source = c;
+        }
+        if (source == null) {
+          _setStatus('❌ Source castle not found');
+          return;
+        }
+
+        final catalog = await _client!.loadCatalog();
         final freshUnits = await _client!.getCastleUnits(
             source.kingdomId, source.areaId, catalog);
+
         final sendable = freshUnits
             .where((u) => _isOffensiveUnit(u) && u.amount > 0)
             .toList();
-        final totalUnits =
-            sendable.fold<int>(0, (s, u) => s + u.amount);
+        final totalUnits = sendable.fold<int>(0, (s, u) => s + u.amount);
 
+        // ═══ STOP #1: الجنود خلصت ═══
         if (totalUnits < minUnits) {
           _setStatus('💤 Idle — units: $totalUnits (< $minUnits)');
+          if (attacksThisTick > 0) {
+            TrafficLog.add('ST',
+                '[Samurai-Auto] ✅ Done $attacksThisTick attacks — units ran out');
+          }
           return;
         }
 
@@ -465,20 +466,23 @@ class SamuraiAutoService {
               .where((c) => selectedCmds.contains(c.lord.id))
               .toList();
         }
+
+        // ═══ STOP #2: كل القواد مشغولين ═══
         if (freeLords.isEmpty) {
           _setStatus('💤 Idle — no free commanders');
+          if (attacksThisTick > 0) {
+            TrafficLog.add('ST',
+                '[Samurai-Auto] ✅ Done $attacksThisTick attacks — all lords busy');
+          }
           return;
         }
 
+        // ─── اختيار الهدف (round-robin) ───
         final now = DateTime.now();
-        final candidates = _camps
+        var candidates = _camps
             .where((c) => !c.isDead)
             .where((c) => !c.isPlayerCamp)
             .where((c) => !(skipDaimyo && c.isDaimyoCastle))
-            .where((c) {
-              final cd = _cooldowns[c.key];
-              return cd == null || !cd.isAfter(now);
-            })
             .where((c) {
               final fail = _failedCamps[c.key];
               return fail == null || !fail.isAfter(now);
@@ -488,76 +492,106 @@ class SamuraiAutoService {
           ..sort((a, b) =>
               a.distanceFromSource.compareTo(b.distanceFromSource));
 
+        // ✅ لو كل المعسكرات اتضربت في الـ round ده → ابدأ round جديد
         if (candidates.isEmpty) {
-          _setStatus('⏳ No candidates (all cooldown/failed)');
-          return;
+          final allAvailable = _camps
+              .where((c) => !c.isDead)
+              .where((c) => !c.isPlayerCamp)
+              .where((c) => !(skipDaimyo && c.isDaimyoCastle))
+              .where((c) {
+                final fail = _failedCamps[c.key];
+                return fail == null || !fail.isAfter(now);
+              })
+              .toList();
+
+          if (allAvailable.isEmpty) {
+            _setStatus('⏳ No candidates (all failed)');
+            if (attacksThisTick > 0) {
+              TrafficLog.add('ST',
+                  '[Samurai-Auto] ✅ Done $attacksThisTick attacks — no targets');
+            }
+            return;
+          }
+
+          // 🔄 round جديد
+          _attackedThisTick.clear();
+          candidates = allAvailable
+            ..sort((a, b) =>
+                a.distanceFromSource.compareTo(b.distanceFromSource));
+          TrafficLog.add('ST',
+              '[Samurai-Auto] 🔄 New round — ${candidates.length} targets available');
         }
 
         final camp = candidates.first;
-        attempts++;
 
         final config = SamuraiAttackConfig(
           waves: await getWaves(),
           toolId: await getToolId(),
-          fallbackToolId: await getFallbackToolId(),  // ✅
           toolL: await getToolL(),
           toolR: await getToolR(),
           toolM: await getToolM(),
           attackDaimyoCastles: !skipDaimyo,
         );
 
+        // ─── محاولة الهجوم ───
         bool attacked = false;
         for (final lordInfo in freeLords) {
-          _setStatus('⚔️ ${camp.coordsLabel} · L${lordInfo.lord.id}');
+          _setStatus(
+              '⚔️ ${camp.coordsLabel} · L${lordInfo.lord.id} '
+              '(#${attacksThisTick + 1})');
+
           final result = await _svc!.attack(
             camp: camp,
             source: source,
             lordId: lordInfo.lord.id,
             fallbackLords: null,
             availableUnits: sendable,
-            allUnitsForTools: freshUnits,  // ✅ كل وحدات القلعة للتحقق من الأدوات
+            allUnitsForTools: freshUnits,
             config: config,
+            markCooldownAfterSuccess: false, // ❌ مفيش cooldown
           );
 
+          // ═══ نجح ═══
           if (result.success) {
             attacksThisTick++;
             attacksThisSession++;
-            _attackedThisTick.add(camp.key);
-            _cooldowns[camp.key] = DateTime.now()
-                .add(const Duration(minutes: kSuccessCooldownMin));
-            await _saveCooldowns();
+            _attackedThisTick.add(camp.key); // للـ round-robin بس
             await _incrementAttacksToday();
+            failStreak = 0;
 
             TrafficLog.add('ST',
-                '[Samurai-Auto] ✅ HIT ${camp.coordsLabel} units=${result.totalUnits} tools=${result.usedTools}');
-            _setStatus('✅ Hit ${camp.coordsLabel}! (#$attacksThisTick)');
+                '[Samurai-Auto] ✅ HIT ${camp.coordsLabel} '
+                'units=${result.totalUnits} (#$attacksThisTick)');
+            _setStatus(
+                '✅ Hit ${camp.coordsLabel}! (#$attacksThisTick)');
 
-            final delaySec = delayMin +
-                Random().nextInt((delayMax - delayMin + 1).clamp(1, 999));
+            // ⏱ فاصل بسيط 3-5 ثواني (للأمان من البان)
+            final gapMs = 3000 + Random().nextInt(2000);
             TrafficLog.add('ST',
-                '[Samurai-Auto] ⏳ waiting $delaySec sec');
-            await Future.delayed(Duration(seconds: delaySec));
+                '[Samurai-Auto] ⏱ gap ${gapMs}ms before next attack');
+            await Future.delayed(Duration(milliseconds: gapMs));
             if (!_running) return;
-
             attacked = true;
             break;
           }
 
+          // ═══ فشل ═══
           final err = result.error ?? '';
+
           if (err.contains('CRA 6') || err.contains('TARGET_REJECTED')) {
             _failedCamps[camp.key] =
                 DateTime.now().add(const Duration(hours: 2));
             await _saveFailedCamps();
-            TrafficLog.add('ST',
-                '[Samurai-Auto] ⏸️ ${camp.coordsLabel} rejected');
             _attackedThisTick.add(camp.key);
             break;
           }
+
           if (err.contains('256') ||
               err.contains('218') ||
               err.contains('LORD_BUSY')) {
-            continue;
+            continue; // جرّب لورد تاني على نفس الهدف
           }
+
           if (err.contains('91') || err.contains('NO_OFFENSIVE_UNITS')) {
             _failedCamps[camp.key] = DateTime.now()
                 .add(Duration(minutes: kFailedCampCooldownMin));
@@ -575,7 +609,21 @@ class SamuraiAutoService {
           break;
         }
 
-        if (!attacked) continue;
+        if (!attacked) {
+          failStreak++;
+          TrafficLog.add('ST',
+              '[Samurai-Auto] ⚠️ fail streak: $failStreak/$maxFailStreak');
+          if (failStreak >= maxFailStreak) {
+            _setStatus('🛑 Too many failures — waiting next cycle');
+            return;
+          }
+          await Future.delayed(const Duration(seconds: 3));
+        }
+      }
+
+      if (attacksThisTick >= safetyMaxAttacks) {
+        TrafficLog.add('ST',
+            '[Samurai-Auto] ⚠️ Safety limit ($safetyMaxAttacks) reached');
       }
     } catch (e) {
       _setStatus('❌ Attack loop error: $e');
