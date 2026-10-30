@@ -16,11 +16,14 @@ const int kSamuraiRadiusStep = 10;
 const int kSamuraiDefaultRadius = 30;
 const int kSamuraiDefaultCooldownMin = 5;
 
+// ✅ حدود آمنة (مبنية على level 40 — نجحت فعليًا في البوت)
+const int kSafeMaxFlankUnits = 42;
+const int kSafeMaxMiddleUnits = 124;
+
 // ═══════════════════════════════════════════════════
-//  Level-based formulas (من البوت القديم)
+//  Level-based formulas
 // ═══════════════════════════════════════════════════
 class SamuraiMath {
-  /// الحد الأقصى للوحدات في الموجة الكاملة (flank*2 + middle)
   static int maxAttackers(int lvl) {
     if (lvl <= 69) {
       final a = 5 * lvl + 8;
@@ -47,7 +50,6 @@ class SamuraiMath {
     return 50;
   }
 
-  /// عدد الـ waves المتاح حسب level اللاعب
   static int wavesUnlocked(int playerLvl) {
     if (playerLvl >= 51) return 4;
     if (playerLvl >= 26) return 3;
@@ -60,11 +62,11 @@ class SamuraiMath {
 //  إعدادات أمر الهجوم
 // ═══════════════════════════════════════════════════
 class SamuraiAttackConfig {
-  final int waves;        // 1..3
-  final int? toolId;      // 166 = أداة عملات الساموراي (null = بدون أدوات)
-  final int toolL;        // عدد الأدوات في الجناح اليسار
-  final int toolR;        // اليمين
-  final int toolM;        // الأمام
+  final int waves;
+  final int? toolId;
+  final int toolL;
+  final int toolR;
+  final int toolM;
 
   const SamuraiAttackConfig({
     this.waves = 3,
@@ -101,10 +103,10 @@ class SamuraiAttackConfig {
 class SamuraiCamp {
   final int x, y, kid;
   final int type;
-  final int hp;         // ai[8] للأنواع 37/38 (لـ 29 = campID)
-  final int level;      // ai[9] — level المعسكر
-  final int level2;     // ai[10] — level احتياطي
-  final int campId;     // للـ type 29 فقط
+  final int hp;
+  final int level;
+  final int level2;
+  final int campId;
   final double distanceFromSource;
   final int sourceAreaId;
   final String sourceName;
@@ -132,7 +134,6 @@ class SamuraiCamp {
   String get coordsLabel => '($x,$y)';
   String get key => '$x,$y,$kid';
 
-  /// مدمر لو HP=0 (الأنواع 37/38 فقط — لـ 29 مفيش HP في AI)
   bool get isDead => type != 29 && hp <= 0;
 
   bool get hasActiveAttack {
@@ -367,14 +368,11 @@ class SamuraiService {
               int hp = 0, level = 0, level2 = 0, campId = 0;
 
               if (type == 29) {
-                // ⚠️ ai[8] = eventAutoScalingCampID (مش HP!)
                 if (entry.length > 8) campId = _asInt(entry[8]);
                 if (entry.length > 9) level = _asInt(entry[9]);
                 if (entry.length > 10) level2 = _asInt(entry[10]);
-                // لو الـ level صفر، استخدم level2 كـ fallback
                 if (level <= 0 && level2 > 0) level = level2;
               } else {
-                // 37 و 38: ai[8] = HP, ai[9] = level, ai[10] = maxLevel
                 if (entry.length > 8) hp = _asInt(entry[8]);
                 if (entry.length > 9) level = _asInt(entry[9]);
                 if (entry.length > 10) level2 = _asInt(entry[10]);
@@ -407,7 +405,7 @@ class SamuraiService {
   }
 
   // ═══════════════════════════════════════════════
-  //  🔥 الهجوم (كامل — waves + tools + fallback)
+  //  🔥 الهجوم — مع 3 محاولات fallback
   // ═══════════════════════════════════════════════
   Future<SamuraiAttackResult> attack({
     required SamuraiCamp camp,
@@ -418,6 +416,72 @@ class SamuraiService {
     int? manualLevel,
     bool markCooldownAfterSuccess = true,
   }) async {
+    // ─── المحاولة 1: الإعدادات الكاملة (مع حدود آمنة) ───
+    TrafficLog.add('ST',
+        '[Samurai] ⚔️ Attempt 1: ${config.waves} waves · ${config.useTools ? "with tools" : "no tools"}');
+    
+    var result = await _tryAttack(
+      camp: camp, source: source, lordId: lordId,
+      availableUnits: availableUnits, config: config,
+      manualLevel: manualLevel,
+      unitScale: 1.0,
+    );
+
+    if (result.success) {
+      if (markCooldownAfterSuccess) await markCampAttacked(camp);
+      return result;
+    }
+
+    // ─── المحاولة 2: لو 313 → جرّب wave واحدة و 70% وحدات ───
+    if (result.error == 'CRA 313' || result.error == 'TOO_MANY_UNITS_313') {
+      TrafficLog.add('ST',
+          '[Samurai] ⚠️ 313 — Retry: 1 wave · 70% units · same tools');
+      result = await _tryAttack(
+        camp: camp, source: source, lordId: lordId,
+        availableUnits: availableUnits,
+        config: config.copyWith(waves: 1),
+        manualLevel: manualLevel,
+        unitScale: 0.7,
+      );
+      if (result.success) {
+        if (markCooldownAfterSuccess) await markCampAttacked(camp);
+        return result;
+      }
+    }
+
+    // ─── المحاولة 3: لو لسه فاشل → جرّب بدون أدوات ───
+    if (config.useTools && (result.error?.contains('313') == true ||
+        result.error == 'CRA 100' ||
+        result.error == 'UNIT_NOT_SENDABLE_91')) {
+      TrafficLog.add('ST',
+          '[Samurai] ⚠️ Retry: 1 wave · 70% units · WITHOUT tools');
+      result = await _tryAttack(
+        camp: camp, source: source, lordId: lordId,
+        availableUnits: availableUnits,
+        config: config.withoutTools().copyWith(waves: 1),
+        manualLevel: manualLevel,
+        unitScale: 0.7,
+      );
+      if (result.success) {
+        if (markCooldownAfterSuccess) await markCampAttacked(camp);
+        return result;
+      }
+    }
+
+    TrafficLog.add('ER',
+        '[Samurai] ❌ All attempts failed: ${result.error}');
+    return result;
+  }
+
+  Future<SamuraiAttackResult> _tryAttack({
+    required SamuraiCamp camp,
+    required OwnedCastle source,
+    required int lordId,
+    required List<CastleUnit> availableUnits,
+    required SamuraiAttackConfig config,
+    int? manualLevel,
+    double unitScale = 1.0,
+  }) async {
     // 1) تحديد الـ level
     final lvl = manualLevel ?? (camp.level > 0 ? camp.level : camp.level2);
     if (lvl <= 0) {
@@ -425,9 +489,11 @@ class SamuraiService {
           'LEVEL_UNKNOWN: محتاج تحدد level المعسكر يدويًا');
     }
 
-    // 2) الحد الأقصى للوحدات لكل موقع
-    final maxFlankUnits = SamuraiMath.flankMax(lvl);
-    final maxMiddleUnits = SamuraiMath.middleMax(lvl);
+    // 2) ✅ حدود آمنة — نأخذ الأقل بين max attack و safe cap
+    final rawFlank = SamuraiMath.flankMax(lvl);
+    final rawMiddle = SamuraiMath.middleMax(lvl);
+    final maxFlankUnits = min(rawFlank, kSafeMaxFlankUnits);
+    final maxMiddleUnits = min(rawMiddle, kSafeMaxMiddleUnits);
     final maxFlankTools = SamuraiMath.toolCapFlank(lvl);
     final maxMiddleTools = SamuraiMath.toolCapMiddle(lvl);
 
@@ -469,21 +535,23 @@ class SamuraiService {
 
     for (int w = 0; w < waveCount; w++) {
       final isFirstWave = (w == 0);
-
-      // Wave 0: ranged flanks (اختبار) — Waves 1+: melee flanks (ضربة قوية)
       final flankPool = (isFirstWave || melee.isEmpty) ? ranged : melee;
       final middlePool = ranged.isNotEmpty ? ranged : melee;
 
-      final lU = _fillFromPool(remaining, flankPool, maxFlankUnits, 2);
-      final rU = _fillFromPool(remaining, flankPool, maxFlankUnits, 2);
-      final mU = _fillFromPool(remaining, middlePool, maxMiddleUnits, 6);
+      // ✅ نطبق unitScale
+      final scaledFlank = (maxFlankUnits * unitScale).round();
+      final scaledMiddle = (maxMiddleUnits * unitScale).round();
+
+      final lU = _fillFromPool(remaining, flankPool, scaledFlank, 2);
+      final rU = _fillFromPool(remaining, flankPool, scaledFlank, 2);
+      final mU = _fillFromPool(remaining, middlePool, scaledMiddle, 6);
 
       final waveSum = _sum(lU) + _sum(rU) + _sum(mU);
       if (waveSum == 0) break;
 
       totalSent += waveSum;
 
-      // Tools
+      // ✅ Tools — كلها في slot 0 (منع تكرار نفس الأداة)
       List<List<int>> lT2, rT2, mT2;
       if (config.useTools) {
         lT2 = _fillTools(config.toolId!, config.toolL, 2, maxFlankTools);
@@ -520,28 +588,27 @@ class SamuraiService {
     }
 
     // 8) بناء الـ payload
-    Map<String, dynamic> buildPayload(List<Map<String, dynamic>> waves) => {
-          'SX': source.x, 'SY': source.y,
-          'TX': camp.x, 'TY': camp.y,
-          'KID': camp.kid, 'LID': lordId,
-          'WT': 0, 'HBW': -1, 'BPC': 0, 'ATT': 0, 'AV': 0,
-          'LP': 0, 'FC': 0, 'PTT': 1, 'SD': 0, 'ICA': 0, 'CD': 99,
-          'A': waves,
-          'BKS': [],
-          'AST': [-1, -1, -1],
-          'RW': List.generate(8, (_) => [-1, 0]),
-          'ASCT': 0,
-        };
+    final payload = {
+      'SX': source.x, 'SY': source.y,
+      'TX': camp.x, 'TY': camp.y,
+      'KID': camp.kid, 'LID': lordId,
+      'WT': 0, 'HBW': -1, 'BPC': 0, 'ATT': 0, 'AV': 0,
+      'LP': 0, 'FC': 0, 'PTT': 1, 'SD': 0, 'ICA': 0, 'CD': 99,
+      'A': wavesPayload,
+      'BKS': [],
+      'AST': [-1, -1, -1],
+      'RW': List.generate(8, (_) => [-1, 0]),
+      'ASCT': 0,
+    };
 
     await _ensureKingdom(camp.kid);
 
     // 9) إرسال
-    final firstTry = await _sendAttack(buildPayload(wavesPayload), camp);
+    final result = await _sendAttack(payload, camp);
 
-    if (firstTry.success) {
-      if (markCooldownAfterSuccess) await markCampAttacked(camp);
+    if (result.success) {
       return SamuraiAttackResult.ok(
-        mid: firstTry.movementId ?? -1,
+        mid: result.movementId ?? -1,
         t: camp,
         units: totalSent,
         waves: wavesPayload.length,
@@ -549,42 +616,7 @@ class SamuraiService {
         usedTools: config.useTools,
       );
     }
-
-    // 10) fallback — لو فشل ومفعّل الأدوات، جرّب بدونها
-    if (config.useTools && firstTry.error != 'LEVEL_UNKNOWN') {
-      final noToolWaves = wavesPayload.map((w) => {
-            'L': {
-              'T': List.generate(2, (_) => [-1, 0]),
-              'U': w['L']['U'],
-            },
-            'R': {
-              'T': List.generate(2, (_) => [-1, 0]),
-              'U': w['R']['U'],
-            },
-            'M': {
-              'T': List.generate(3, (_) => [-1, 0]),
-              'U': w['M']['U'],
-            },
-          }).toList();
-
-      final secondTry =
-          await _sendAttack(buildPayload(noToolWaves), camp);
-
-      if (secondTry.success) {
-        if (markCooldownAfterSuccess) await markCampAttacked(camp);
-        return SamuraiAttackResult.ok(
-          mid: secondTry.movementId ?? -1,
-          t: camp,
-          units: totalSent,
-          waves: noToolWaves.length,
-          tools: 0,
-          usedTools: false,
-        );
-      }
-      return secondTry;
-    }
-
-    return firstTry;
+    return result;
   }
 
   Future<SamuraiAttackResult> _sendAttack(
@@ -651,6 +683,8 @@ class SamuraiService {
     return out;
   }
 
+  /// ✅ كل الأدوات في slot 0 — عشان نمنع تكرار نفس الأداة في slot تاني
+  /// (ده اللي كان بيسبب error 313)
   List<List<int>> _fillTools(int toolId, int total, int slots, int cap) {
     if (toolId <= 0 || total <= 0) {
       return List.generate(slots, (_) => [-1, 0]);
@@ -658,20 +692,8 @@ class SamuraiService {
     final effective = total.clamp(0, cap);
     if (effective <= 0) return List.generate(slots, (_) => [-1, 0]);
 
-    // وزّع على الـ slots بالعدل
-    final out = <List<int>>[];
-    int remaining = effective;
-    for (int i = 0; i < slots; i++) {
-      final left = slots - i;
-      final take = (remaining / left).ceil();
-      if (take > 0 && remaining > 0) {
-        final amt = take > remaining ? remaining : take;
-        out.add([toolId, amt]);
-        remaining -= amt;
-      } else {
-        out.add([-1, 0]);
-      }
-    }
+    final out = List.generate(slots, (_) => [-1, 0]);
+    out[0] = [toolId, effective];
     return out;
   }
 
