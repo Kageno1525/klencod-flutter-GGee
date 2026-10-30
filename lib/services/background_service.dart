@@ -54,22 +54,25 @@ class _BgArmy {
   _BgArmy({required this.left, required this.middle, required this.right, required this.total});
 }
 
+// ═══════════════════════════════════════════════════════════
+//  Samurai Model Classes
+// ═══════════════════════════════════════════════════════════
 class _SamuraiCamp {
   final int x, y, kid;
-  final int type;
-  final int hp;
-  final int level;
+  final int type, hp, level, level2, ownerId;
   final double distance;
   _SamuraiCamp({
     required this.x, required this.y, required this.kid,
-    required this.type, required this.hp, required this.level,
-    required this.distance,
+    required this.type, required this.hp,
+    required this.level, required this.level2,
+    required this.ownerId, required this.distance,
   });
   String get key => '$x,$y,$kid';
   String get coordsLabel => '($x,$y)';
-  bool get isDaimyo => type == 37 || type == 38;
-  bool get isRealCamp => type == 29;
-  bool get isDead => !isRealCamp && hp <= 0;
+  bool get isDaimyoCastle => type == 37 || type == 38;
+  bool get isPlayerCamp => ownerId != -1;
+  bool get isDead => type != 29 && hp <= 0;
+  int get effectiveLevel => level > 0 ? level : level2;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -89,13 +92,10 @@ class _GgeTaskHandler extends TaskHandler {
   Timer? _pollTimer;
   Timer? _trainTimer;
   Timer? _desertTimer;
-  Timer? _samuraiTimer;
   bool _connected = false;
   bool _loggedIn = false;
   String? _token;
   int? _mainCastleArea;
-
-  bool _anyBotRunning = false;
 
   // ═══ Desert state ═══
   int? _sourceAreaId;
@@ -119,39 +119,40 @@ class _GgeTaskHandler extends TaskHandler {
   bool _runningDesert = false;
 
   // ═══ Samurai state ═══
-  int _samuraiSourceArea = 0;
-  int _samuraiSourceKid = 0;
-  int _samuraiSourceX = 0;
-  int _samuraiSourceY = 0;
-  Set<int> _samuraiCommanderIds = {};
-  int _samuraiMinUnits = 30;
-  int _samuraiToolId = 166;
-  int _samuraiToolL = 20;
-  int _samuraiToolR = 20;
-  int _samuraiToolM = 30;
-  int _samuraiWaves = 3;
+  bool _samuraiEnabled = false;
+  int? _samuraiSourceAreaId;
+  int? _samuraiSourceX, _samuraiSourceY, _samuraiSourceKid;
+  int _samuraiRadius = 5;
   int _samuraiMaxLevel = 60;
   bool _samuraiSkipDaimyo = true;
-  int _samuraiDelayMin = 10;
-  int _samuraiDelayMax = 15;
+  int _samuraiMinUnits = 30;
+  int _samuraiWaves = 3;
+  int? _samuraiToolId = 166;
+  int? _samuraiFallbackToolId = 30;
+  int _samuraiToolL = 20, _samuraiToolR = 20, _samuraiToolM = 30;
   int _samuraiMaxAttacksDay = 0;
   int _samuraiAttacksToday = 0;
   String _samuraiAttacksDate = '';
-  int _samuraiAttacksSession = 0;
-  bool _runningSamurai = false;
-  List<_SamuraiCamp> _samuraiCamps = [];
-  DateTime? _lastSamuraiScanAt;
-  final Map<String, DateTime> _samuraiCooldowns = {};
-  final Map<String, DateTime> _samuraiFailedCamps = {};
-
-  Map<int, int>? _samuraiCachedUnits;
-  DateTime? _samuraiUnitsFetchAt;
-  Set<int>? _samuraiCachedActiveLords;
-  DateTime? _samuraiActiveLordsFetchAt;
-
-  int? _samuraiLastJcaKid;
+  int _samuraiPlayerLevel = 0;
+  int? _samuraiCurrentKid;
   DateTime? _samuraiLastJcaAt;
 
+  final List<_SamuraiCamp> _samuraiCamps = [];
+  DateTime? _samuraiLastScanAt;
+  final Map<String, DateTime> _samuraiFailedCamps = {};
+
+  Timer? _samuraiTimer;
+  bool _runningSamurai = false;
+
+  static const int _kSamuraiCampType = 29;
+  static const Set<int> _kDaimyoCastleTypes = {37, 38};
+  static const Set<int> _kAllSamuraiTypes = {29, 37, 38};
+  static const int _kSamuraiChunkSize = 13;
+  static const int _kSamuraiScanCacheMin = 5;
+  static const int _kSamuraiFailedCooldownMin = 30;
+  static const Set<int> _kDefensiveWodIds = {1, 2, 3, 4, 5, 6, 7, 8};
+
+  // ═══ Anti-ban ═══
   DateTime _lastActionTime = DateTime.now();
   bool _isProcessing = false;
   DateTime? _nextBreakAt;
@@ -165,23 +166,17 @@ class _GgeTaskHandler extends TaskHandler {
     try { FlutterForegroundTask.sendDataToMain('LOG:$s'); } catch (_) {}
   }
 
-  Future<void> _saveStatus(String status,
-      {String? extra, String prefix = 'bg'}) async {
+  Future<void> _saveStatus(String status, {String? extra}) async {
     try {
-      await FlutterForegroundTask.saveData(key: '${prefix}_status', value: status);
-      await FlutterForegroundTask.saveData(
-          key: '${prefix}_time', value: DateTime.now().toIso8601String());
-      await FlutterForegroundTask.saveData(key: '${prefix}_extra', value: extra ?? '');
+      await FlutterForegroundTask.saveData(key: 'bg_status', value: status);
+      await FlutterForegroundTask.saveData(key: 'bg_time', value: DateTime.now().toIso8601String());
+      await FlutterForegroundTask.saveData(key: 'bg_extra', value: extra ?? '');
     } catch (_) {}
   }
 
-  Future<void> _saveSamuraiStatus(String status, {String? extra}) =>
-      _saveStatus(status, extra: extra, prefix: 'bg_samurai');
-
   String _todayStr() {
     final d = DateTime.now();
-    return '${d.year}-${d.month.toString().padLeft(2, '0')}-'
-        '${d.day.toString().padLeft(2, '0')}';
+    return '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
   }
 
   // ═══════════════════════════════════════════════════════
@@ -191,7 +186,6 @@ class _GgeTaskHandler extends TaskHandler {
   Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
     _log('Service Started');
     await _saveStatus('STARTING');
-    await _saveSamuraiStatus('STARTING');
 
     final prefs = await SharedPreferences.getInstance();
     _token = prefs.getString('login_token');
@@ -202,7 +196,7 @@ class _GgeTaskHandler extends TaskHandler {
     _connect();
     _startAutoTrainTimer();
     _scheduleNextDesertTick();
-    _startSamuraiLoop();
+    _scheduleNextSamuraiTick();
   }
 
   @override
@@ -219,7 +213,6 @@ class _GgeTaskHandler extends TaskHandler {
     _connected = false;
     _loggedIn = false;
     await _saveStatus('DESTROYED');
-    await _saveSamuraiStatus('DESTROYED');
   }
 
   @override
@@ -294,6 +287,9 @@ class _GgeTaskHandler extends TaskHandler {
         }
       } catch (_) {}
     }
+
+    _log('Desert loaded: enabled=$_desertEnabled radius=$_radiusTiles srcArea=$_sourceAreaId '
+         'attacksToday=$_attacksToday/$_maxAttacksDay session=$_maxAttacksSession');
   }
 
   Future<void> _persistDesertState() async {
@@ -315,67 +311,6 @@ class _GgeTaskHandler extends TaskHandler {
     await prefs.setString('desert_auto_failed_towers', jsonEncode(ftData));
   }
 
-  // ═══════════════════════════════════════════════════════
-  //  ✅ Samurai persistence — الأهم
-  // ═══════════════════════════════════════════════════════
-  Future<void> _loadSamuraiState() async {
-    final prefs = await SharedPreferences.getInstance();
-    _samuraiSourceArea = prefs.getInt('samurai_auto_source_area') ?? 0;
-    _samuraiSourceKid = prefs.getInt('samurai_auto_source_kid') ?? 0;
-    _samuraiSourceX = prefs.getInt('samurai_auto_source_x') ?? 0;
-    _samuraiSourceY = prefs.getInt('samurai_auto_source_y') ?? 0;
-    final rawIds = prefs.getStringList('samurai_auto_commander_ids') ?? [];
-    _samuraiCommanderIds =
-        rawIds.map((s) => int.tryParse(s) ?? 0).where((i) => i > 0).toSet();
-    _samuraiMinUnits = prefs.getInt('samurai_auto_min_units') ?? 30;
-    _samuraiToolId = prefs.getInt('samurai_auto_tool_id') ?? 166;
-    _samuraiToolL = prefs.getInt('samurai_auto_tool_l') ?? 20;
-    _samuraiToolR = prefs.getInt('samurai_auto_tool_r') ?? 20;
-    _samuraiToolM = prefs.getInt('samurai_auto_tool_m') ?? 30;
-    _samuraiWaves = prefs.getInt('samurai_auto_waves') ?? 3;
-    _samuraiMaxLevel = prefs.getInt('samurai_auto_max_level') ?? 60;
-    _samuraiSkipDaimyo = prefs.getBool('samurai_auto_skip_daimyo') ?? true;
-    _samuraiDelayMin = prefs.getInt('samurai_auto_delay_min') ?? 10;
-    _samuraiDelayMax = prefs.getInt('samurai_auto_delay_max') ?? 15;
-    _samuraiMaxAttacksDay = prefs.getInt('samurai_auto_max_attacks_day') ?? 0;
-    _samuraiAttacksToday = prefs.getInt('samurai_auto_attacks_today') ?? 0;
-    _samuraiAttacksDate = prefs.getString('samurai_auto_attacks_date') ?? '';
-    _samuraiAttacksSession = 0;
-
-    final today = _todayStr();
-    if (_samuraiAttacksDate != today) {
-      _samuraiAttacksToday = 0;
-      _samuraiAttacksDate = today;
-      await prefs.setInt('samurai_auto_attacks_today', 0);
-      await prefs.setString('samurai_auto_attacks_date', today);
-    }
-
-    final cd = prefs.getString('samurai_cooldowns_v1');
-    if (cd != null && cd.isNotEmpty) {
-      try {
-        final data = jsonDecode(cd) as Map;
-        final now = DateTime.now();
-        for (final e in data.entries) {
-          final dt = DateTime.tryParse(e.value.toString());
-          if (dt != null && dt.isAfter(now)) _samuraiCooldowns[e.key] = dt;
-        }
-      } catch (_) {}
-    }
-  }
-
-  Future<void> _persistSamuraiState() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setInt('samurai_auto_attacks_today', _samuraiAttacksToday);
-    await prefs.setString('samurai_auto_attacks_date', _samuraiAttacksDate);
-
-    final now = DateTime.now();
-    final cd = <String, String>{};
-    for (final e in _samuraiCooldowns.entries) {
-      if (e.value.isAfter(now)) cd[e.key] = e.value.toIso8601String();
-    }
-    await prefs.setString('samurai_cooldowns_v1', jsonEncode(cd));
-  }
-
   bool _looksRanged(String name) {
     final n = name.toLowerCase();
     return n.contains('bow') || n.contains('archer') || n.contains('crossbow') ||
@@ -385,7 +320,67 @@ class _GgeTaskHandler extends TaskHandler {
         n.contains('منجنيق') || n.contains('عرادة') || n.contains('قاذف');
   }
 
-  bool _isDefensiveWod(int wodId) => wodId >= 1 && wodId <= 8;
+  // ═══════════════════════════════════════════════════════
+  //  Samurai persistence
+  // ═══════════════════════════════════════════════════════
+  Future<void> _loadSamuraiState() async {
+    final prefs = await SharedPreferences.getInstance();
+    _samuraiEnabled = prefs.getBool('samurai_auto_enabled') ?? false;
+    _samuraiSourceAreaId = prefs.getInt('samurai_auto_source_area');
+    _samuraiSourceKid = prefs.getInt('samurai_auto_source_kid');
+    _samuraiRadius = prefs.getInt('samurai_radius_v1') ?? 5;
+    _samuraiMaxLevel = prefs.getInt('samurai_max_level_v1') ?? 60;
+    _samuraiSkipDaimyo = prefs.getBool('samurai_skip_daimyo_v1') ?? true;
+    _samuraiMinUnits = prefs.getInt('samurai_auto_min_units') ?? 30;
+    _samuraiWaves = prefs.getInt('samurai_auto_waves') ?? 3;
+    _samuraiToolId = prefs.getInt('samurai_auto_tool_id') ?? 166;
+    _samuraiToolL = prefs.getInt('samurai_auto_tool_l') ?? 20;
+    _samuraiToolR = prefs.getInt('samurai_auto_tool_r') ?? 20;
+    _samuraiToolM = prefs.getInt('samurai_auto_tool_m') ?? 30;
+    _samuraiMaxAttacksDay = prefs.getInt('samurai_auto_max_attacks_day') ?? 0;
+    _samuraiAttacksToday = prefs.getInt('samurai_auto_attacks_today') ?? 0;
+    _samuraiAttacksDate = prefs.getString('samurai_auto_attacks_date') ?? '';
+
+    final today = _todayStr();
+    if (_samuraiAttacksDate != today) {
+      _samuraiAttacksToday = 0;
+      _samuraiAttacksDate = today;
+      await prefs.setInt('samurai_auto_attacks_today', 0);
+      await prefs.setString('samurai_auto_attacks_date', today);
+    }
+
+    final ftJson = prefs.getString('samurai_auto_failed_camps');
+    if (ftJson != null && ftJson.isNotEmpty) {
+      try {
+        final data = jsonDecode(ftJson) as Map;
+        final now = DateTime.now();
+        for (final e in data.entries) {
+          final dt = DateTime.tryParse(e.value.toString());
+          if (dt != null && dt.isAfter(now)) {
+            _samuraiFailedCamps[e.key] = dt;
+          }
+        }
+      } catch (_) {}
+    }
+
+    _log('Samurai loaded: enabled=$_samuraiEnabled radius=$_samuraiRadius '
+         'srcArea=$_samuraiSourceAreaId attacksToday=$_samuraiAttacksToday/$_samuraiMaxAttacksDay');
+  }
+
+  Future<void> _persistSamuraiState() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt('samurai_auto_attacks_today', _samuraiAttacksToday);
+    await prefs.setString('samurai_auto_attacks_date', _samuraiAttacksDate);
+
+    final now = DateTime.now();
+    final ftData = <String, String>{};
+    for (final e in _samuraiFailedCamps.entries) {
+      if (e.value.isAfter(now)) {
+        ftData[e.key] = e.value.toIso8601String();
+      }
+    }
+    await prefs.setString('samurai_auto_failed_camps', jsonEncode(ftData));
+  }
 
   // ═══════════════════════════════════════════════════════
   //  Throttle
@@ -401,11 +396,14 @@ class _GgeTaskHandler extends TaskHandler {
       if (now.isBefore(_nextBreakAt!)) {
         final wait = _nextBreakAt!.difference(now).inMilliseconds;
         if (wait > 0 && wait < 3600000) {
+          _log('Break ${_nextBreakAt!.difference(now).inMinutes} min');
+          await _saveStatus('ON_BREAK', extra: '${_nextBreakAt!.difference(now).inMinutes} min');
           await Future.delayed(Duration(milliseconds: wait));
         }
       }
       _nextBreakAt = null;
       _actionsSinceBreak = 0;
+      await _saveStatus('ONLINE');
     }
 
     final now = DateTime.now();
@@ -421,6 +419,7 @@ class _GgeTaskHandler extends TaskHandler {
 
     if (_breakEvery > 0 && _actionsSinceBreak >= _breakEvery) {
       _nextBreakAt = DateTime.now().add(Duration(minutes: _breakMinutes));
+      _log('Break scheduled: $_breakMinutes min after $_actionsSinceBreak actions');
     }
   }
 
@@ -471,10 +470,8 @@ class _GgeTaskHandler extends TaskHandler {
     if (parts.length > 1 && parts[1].startsWith('EmpireEx_')) offset = 2;
     if (parts.length <= offset) return null;
     final cmd = parts[offset];
-    final result =
-        parts.length > offset + 2 ? (int.tryParse(parts[offset + 2]) ?? -1) : -1;
-    final payload =
-        parts.length > offset + 3 ? parts.sublist(offset + 3).join('%') : null;
+    final result = parts.length > offset + 2 ? (int.tryParse(parts[offset + 2]) ?? -1) : -1;
+    final payload = parts.length > offset + 3 ? parts.sublist(offset + 3).join('%') : null;
     return _XtMsg(cmd, result, payload);
   }
 
@@ -485,7 +482,6 @@ class _GgeTaskHandler extends TaskHandler {
     try {
       _log('Connecting...');
       await _saveStatus('CONNECTING');
-      await _saveSamuraiStatus('CONNECTING');
       _ws = await WebSocket.connect(_url).timeout(const Duration(seconds: 20));
       _connected = true;
       _log('WS Connected');
@@ -530,15 +526,16 @@ class _GgeTaskHandler extends TaskHandler {
         _loggedIn = true;
         _log('Login OK');
         await _saveStatus('ONLINE');
-        await _saveSamuraiStatus('ONLINE');
         _runInit();
       } else {
         _log('Login FAILED');
         await _saveStatus('LOGIN_FAILED');
-        await _saveSamuraiStatus('LOGIN_FAILED');
       }
     } else if (text.contains('bup%1%0%')) {
       _log('BUP OK');
+    } else if (text.contains('bup%1%87%') || text.contains('bup%1%88%')) {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('auto_last_train_time', DateTime.now().toIso8601String());
     }
 
     if (text.startsWith('%xt%')) {
@@ -558,12 +555,13 @@ class _GgeTaskHandler extends TaskHandler {
                 final type = m[1] as int?;
                 if (msgId != null && type == 4) {
                   _latestSpyMessageId = msgId;
+                  _log('Captured spy msgId=$msgId');
                 }
               }
             }
           }
         }
-      } catch (_) {}
+      } catch (e) { _log('sne: $e'); }
     }
   }
 
@@ -572,8 +570,7 @@ class _GgeTaskHandler extends TaskHandler {
     _sendXt('lli', jsonEncode({
       'CONM': 350, 'RTM': 57, 'ID': 0, 'PL': 1,
       'NOM': 'User', 'LT': _token, 'LANG': 'en', 'DID': '0',
-      'AID': '17254677223212351', 'KID': '',
-      'REF': 'https://empire.goodgamestudios.com',
+      'AID': '17254677223212351', 'KID': '', 'REF': 'https://empire.goodgamestudios.com',
       'GCI': '', 'SID': 9, 'PLFID': 1,
     }));
   }
@@ -594,6 +591,9 @@ class _GgeTaskHandler extends TaskHandler {
     });
   }
 
+  // ═══════════════════════════════════════════════════════
+  //  Auto-train
+  // ═══════════════════════════════════════════════════════
   void _startAutoTrainTimer() {
     _trainTimer?.cancel();
     _trainTimer = Timer.periodic(const Duration(seconds: 10), (timer) async {
@@ -603,11 +603,59 @@ class _GgeTaskHandler extends TaskHandler {
       if (!autoEnabled) return;
       final isAppForeground = prefs.getBool('is_app_foreground') ?? false;
       if (isAppForeground) return;
+
+      final useMaxTotal = prefs.getBool('auto_use_max') ?? false;
+      final maxTotal = int.tryParse(prefs.getString('auto_max_total') ?? '1000') ?? 1000;
+      final totalTrained = prefs.getInt('auto_total_trained') ?? 0;
+      if (useMaxTotal && totalTrained >= maxTotal) {
+        await prefs.setBool('auto_enabled', false);
+        return;
+      }
+
+      final triggerOnTime = prefs.getBool('auto_trigger_time') ?? false;
+      final timeInterval = prefs.getInt('auto_time_interval') ?? 5;
+      final timeUnit = prefs.getString('auto_time_unit') ?? 'minutes';
+      final lastTrainStr = prefs.getString('auto_last_train_time');
+      int intervalSeconds = timeInterval;
+      if (timeUnit == 'minutes') intervalSeconds *= 60;
+      if (timeUnit == 'hours') intervalSeconds *= 3600;
+      bool timeTriggered = false;
+      if (triggerOnTime) {
+        if (lastTrainStr == null) timeTriggered = true;
+        else {
+          final last = DateTime.parse(lastTrainStr);
+          if (DateTime.now().difference(last).inSeconds >= intervalSeconds) timeTriggered = true;
+        }
+      }
+
+      final selectedJson = prefs.getString('auto_selected_units');
+      if (selectedJson == null) return;
+      final Map<String, dynamic> selected = jsonDecode(selectedJson);
+      if (selected.isEmpty) return;
+      final List<int> validWods = selected.keys.map((e) => int.parse(e)).toList();
+      final currentIndex = prefs.getInt('auto_rotation_index') ?? 0;
+      final wodId = validWods[currentIndex % validWods.length];
+      final amount = selected[wodId.toString()] as int;
+      final triggerOnSlot = prefs.getBool('auto_trigger_slot') ?? true;
+
+      if (timeTriggered || triggerOnSlot) {
+        _isProcessing = true;
+        _log('AutoTrain WID=$wodId AMT=$amount');
+        await _throttle();
+        _sendXt('bup', jsonEncode({
+          'LID': 0, 'WID': wodId, 'AMT': amount,
+          'PO': -1, 'PWR': 0, 'SK': 0, 'SID': 0, 'AID': _mainCastleArea ?? 1606327,
+        }));
+        await prefs.setString('auto_last_train_time', DateTime.now().toIso8601String());
+        await prefs.setInt('auto_total_trained', totalTrained + amount);
+        await prefs.setInt('auto_rotation_index', currentIndex + 1);
+        Future.delayed(const Duration(seconds: 3), () => _isProcessing = false);
+      }
     });
   }
 
   // ═══════════════════════════════════════════════════════
-  //  DESERT (as-is)
+  //  Desert loop
   // ═══════════════════════════════════════════════════════
   void _scheduleNextDesertTick() {
     final seconds = 480 + Random().nextInt(240);
@@ -620,216 +668,312 @@ class _GgeTaskHandler extends TaskHandler {
   Future<void> _desertTick() async {
     if (!_loggedIn || !_desertEnabled) return;
     if (_sourceAreaId == null || _sourceAreaId == 0) return;
-    if (_anyBotRunning) return;
-
-    _anyBotRunning = true;
-    _runningDesert = true;
-    try {
-      // (same as before)
-    } finally {
-      _runningDesert = false;
-      _anyBotRunning = false;
-    }
-  }
-
-  // ═══════════════════════════════════════════════════════
-  //  🎯 SAMURAI AUTO — النسخة المُصلَحة
-  // ═══════════════════════════════════════════════════════
-  void _startSamuraiLoop() {
-    _samuraiTimer?.cancel();
-    _log('Samurai loop started');
-    _samuraiTick();
-  }
-
-  Future<void> _samuraiTick() async {
-    // ✅ اقرأ enabled من prefs مباشرة (مش memory)
-    bool isEnabled = false;
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      isEnabled = prefs.getBool('samurai_auto_enabled') ?? false;
-    } catch (_) {}
-
-    if (!isEnabled) {
-      await _saveSamuraiStatus('DISABLED');
-      _samuraiTimer = Timer(const Duration(seconds: 5), () => _samuraiTick());
-      return;
-    }
-
-    if (_runningSamurai) {
-      _samuraiTimer = Timer(const Duration(seconds: 3), () => _samuraiTick());
-      return;
-    }
-
-    int nextDelay = 30;
-
-    try {
-      if (!_loggedIn) {
-        await _saveSamuraiStatus('WAIT_LOGIN');
-        nextDelay = 10;
-        _samuraiTimer = Timer(Duration(seconds: nextDelay), () => _samuraiTick());
-        return;
-      }
-
-      if (_anyBotRunning) {
-        nextDelay = 5;
-        _samuraiTimer = Timer(Duration(seconds: nextDelay), () => _samuraiTick());
-        return;
-      }
-
-      // ✅ إعادة قراءة كل الـ settings من prefs كل tick
-      await _reloadSamuraiSettingsFromPrefs();
-
-      _anyBotRunning = true;
-      _runningSamurai = true;
-
-      try {
-        final attacked = await _samuraiWork();
-        if (attacked) {
-          final mn = _samuraiDelayMin;
-          final mx = _samuraiDelayMax;
-          nextDelay = mn + Random().nextInt((mx - mn + 1).clamp(1, 999));
-          if (nextDelay < 5) nextDelay = 5;
-        } else {
-          nextDelay = 15;
-        }
-      } finally {
-        _runningSamurai = false;
-        _anyBotRunning = false;
-      }
-    } catch (e) {
-      _log('Samurai tick error: $e');
-      await _saveSamuraiStatus('ERROR', extra: '$e');
-      nextDelay = 30;
-    } finally {
-      _samuraiTimer = Timer(Duration(seconds: nextDelay), () => _samuraiTick());
-    }
-  }
-
-  /// ✅ يقرأ كل الـ settings من prefs كل tick
-  Future<void> _reloadSamuraiSettingsFromPrefs() async {
-    final prefs = await SharedPreferences.getInstance();
-    _samuraiSourceArea = prefs.getInt('samurai_auto_source_area') ?? 0;
-    _samuraiSourceKid = prefs.getInt('samurai_auto_source_kid') ?? 0;
-    _samuraiSourceX = prefs.getInt('samurai_auto_source_x') ?? 0;
-    _samuraiSourceY = prefs.getInt('samurai_auto_source_y') ?? 0;
-    final rawIds = prefs.getStringList('samurai_auto_commander_ids') ?? [];
-    _samuraiCommanderIds =
-        rawIds.map((s) => int.tryParse(s) ?? 0).where((i) => i > 0).toSet();
-    _samuraiMinUnits = prefs.getInt('samurai_auto_min_units') ?? 30;
-    _samuraiToolId = prefs.getInt('samurai_auto_tool_id') ?? 166;
-    _samuraiToolL = prefs.getInt('samurai_auto_tool_l') ?? 20;
-    _samuraiToolR = prefs.getInt('samurai_auto_tool_r') ?? 20;
-    _samuraiToolM = prefs.getInt('samurai_auto_tool_m') ?? 30;
-    _samuraiWaves = prefs.getInt('samurai_auto_waves') ?? 3;
-    _samuraiMaxLevel = prefs.getInt('samurai_auto_max_level') ?? 60;
-    _samuraiSkipDaimyo = prefs.getBool('samurai_auto_skip_daimyo') ?? true;
-    _samuraiDelayMin = prefs.getInt('samurai_auto_delay_min') ?? 10;
-    _samuraiDelayMax = prefs.getInt('samurai_auto_delay_max') ?? 15;
-    _samuraiMaxAttacksDay = prefs.getInt('samurai_auto_max_attacks_day') ?? 0;
-    _samuraiAttacksToday = prefs.getInt('samurai_auto_attacks_today') ?? 0;
-    _samuraiAttacksDate = prefs.getString('samurai_auto_attacks_date') ?? '';
-  }
-
-  Future<bool> _samuraiWork() async {
-    _log('Samurai work start');
-
-    if (_samuraiSourceArea == 0) {
-      await _saveSamuraiStatus('NO_SOURCE', extra: 'اختر قلعة مصدر');
-      return false;
-    }
 
     final today = _todayStr();
-    if (_samuraiAttacksDate != today) {
-      _samuraiAttacksToday = 0;
-      _samuraiAttacksDate = today;
-      await _persistSamuraiState();
-    }
-    if (_samuraiMaxAttacksDay > 0 && _samuraiAttacksToday >= _samuraiMaxAttacksDay) {
-      await _saveSamuraiStatus('LIMIT_REACHED',
-          extra: '$_samuraiAttacksToday/$_samuraiMaxAttacksDay');
-      return false;
+    if (_attacksDate != today) {
+      _attacksToday = 0;
+      _attacksDate = today;
+      await _persistDesertState();
     }
 
-    if (_samuraiCommanderIds.isEmpty) {
-      await _saveSamuraiStatus('NO_CMDS', extra: 'اختر قواد');
-      return false;
+    if (_maxAttacksDay > 0 && _attacksToday >= _maxAttacksDay) {
+      await _saveStatus('LIMIT_REACHED', extra: 'يومي: $_attacksToday/$_maxAttacksDay');
+      return;
+    }
+    if (_maxAttacksSession > 0 && _attacksThisSession >= _maxAttacksSession) {
+      await _saveStatus('SESSION_LIMIT', extra: 'جلسة: $_attacksThisSession/$_maxAttacksSession');
+      return;
     }
 
-    final units = await _getUnits();
-    if (units.isEmpty) {
-      await _saveSamuraiStatus('NO_UNITS', extra: 'gui empty');
-      return false;
-    }
-    final offensive = units.entries
-        .where((e) => !_isDefensiveWod(e.key) && e.value > 0)
-        .toList();
-    final totalOff = offensive.fold<int>(0, (s, e) => s + e.value);
-    if (totalOff < _samuraiMinUnits) {
-      await _saveSamuraiStatus('LOW_UNITS',
-          extra: 'off=$totalOff < $_samuraiMinUnits');
-      return false;
-    }
-
-    final activeLords = await _getActiveLords();
-    final freeLords = <int>[];
-    for (final lid in _samuraiCommanderIds) {
-      if (!activeLords.contains(lid)) freeLords.add(lid);
-    }
-    if (freeLords.isEmpty) {
-      await _saveSamuraiStatus('ALL_BUSY', extra: 'كل القواد مشغولين');
-      return false;
-    }
-
-    if (_samuraiCamps.isEmpty ||
-        _lastSamuraiScanAt == null ||
-        DateTime.now().difference(_lastSamuraiScanAt!).inMinutes > 30) {
-      final ok = await _ensureSamuraiKingdom(_samuraiSourceKid);
-      if (!ok) {
-        await _saveSamuraiStatus('JCA_FAILED', extra: 'kid=$_samuraiSourceKid');
-        return false;
+    _runningDesert = true;
+    try {
+      final kid = await _ensureKingdom();
+      if (kid == null) {
+        _log('Desert: jca failed');
+        return;
       }
-      await _scanSamuraiCamps();
-    }
 
-    final target = _findSamuraiTarget();
-    if (target == null) {
-      await _saveSamuraiStatus('NO_TARGET',
-          extra: '${_samuraiCamps.length} camps · كلهم cooldown');
-      return false;
-    }
+      await _saveStatus('DESERT_RUN',
+          extra: 'يومي: $_attacksToday/$_maxAttacksDay · جلسة: $_attacksThisSession/$_maxAttacksSession');
 
-    final ok2 = await _ensureSamuraiKingdom(_samuraiSourceKid);
-    if (!ok2) {
-      await _saveSamuraiStatus('JCA_FAILED', extra: 'attack');
-      return false;
-    }
-
-    for (final lid in freeLords) {
-      await _saveSamuraiStatus('ATTACKING',
-          extra: '${target.coordsLabel} · L$lid');
-      _log('Samurai attack ${target.coordsLabel} with L$lid');
-
-      final result = await _attackSamuraiCamp(target, lid, offensive);
-
-      if (result == 'success') return true;
-      if (result == 'lord_busy') continue;
-      if (result == 'target_rejected' || result.startsWith('error:')) {
-        return false;
+      if (_towers.isEmpty ||
+          (_lastScanAt != null && DateTime.now().difference(_lastScanAt!).inMinutes > 60)) {
+        await _scanTowers(kid);
       }
+      if (_towers.isEmpty) return;
+
+      _towers.sort((a, b) => a.distance.compareTo(b.distance));
+
+      int attempts = 0;
+      for (final tower in _towers) {
+        if (attempts >= 5) break;
+        if (_maxAttacksDay > 0 && _attacksToday >= _maxAttacksDay) break;
+        if (_maxAttacksSession > 0 && _attacksThisSession >= _maxAttacksSession) break;
+        if (_isTowerCooling(tower) || _isTowerFailed(tower)) continue;
+
+        attempts++;
+        final ok = await _tryAttackTower(tower);
+        if (ok) {
+          _attacksToday++;
+          _attacksThisSession++;
+          await _persistDesertState();
+          await _saveStatus('ATTACK_HIT',
+              extra: 'يومي: $_attacksToday/$_maxAttacksDay · جلسة: $_attacksThisSession/$_maxAttacksSession');
+        }
+      }
+    } catch (e) {
+      _log('Desert tick: $e');
+    } finally {
+      _runningDesert = false;
     }
-    return false;
   }
 
-  Future<Map<int, int>> _getUnits() async {
-    if (_samuraiCachedUnits != null &&
-        _samuraiUnitsFetchAt != null &&
-        DateTime.now().difference(_samuraiUnitsFetchAt!).inSeconds < 60) {
-      return _samuraiCachedUnits!;
+  Future<int?> _ensureKingdom() async {
+    try {
+      final resp = await _sendXtAndWaitAsync(
+        'jca',
+        jsonEncode({'CID': -1, 'KID': 1}),
+        responseCmd: 'jaa',
+        timeoutMs: 8000,
+        isAction: false,
+      );
+      if (resp.result == 0 && resp.payload != null) {
+        final data = jsonDecode(resp.payload!) as Map;
+        final gca = data['gca'] as Map?;
+        if (gca != null) {
+          final a = gca['A'] as List?;
+          if (a != null && a.length > 3) {
+            _sourceX = int.tryParse(a[1].toString());
+            _sourceY = int.tryParse(a[2].toString());
+            _sourceKid = 1;
+            return 1;
+          }
+        }
+      }
+    } catch (e) { _log('jca: $e'); }
+    return null;
+  }
+
+  bool _isTowerCooling(_DesertTower t) {
+    final dt = _cooldowns[t.key];
+    if (dt == null) return false;
+    if (dt.isBefore(DateTime.now())) { _cooldowns.remove(t.key); return false; }
+    return true;
+  }
+
+  bool _isTowerFailed(_DesertTower t) {
+    final dt = _failedTowers[t.key];
+    if (dt == null) return false;
+    if (dt.isBefore(DateTime.now())) { _failedTowers.remove(t.key); return false; }
+    return true;
+  }
+
+  void _markTowerFailed(_DesertTower t, {int minutes = 240}) {
+    _failedTowers[t.key] = DateTime.now().add(Duration(minutes: minutes));
+  }
+
+  void _markTowerAttacked(_DesertTower t, {int minutes = 240}) {
+    _cooldowns[t.key] = DateTime.now().add(Duration(minutes: minutes));
+  }
+
+  Future<void> _scanTowers(int kid) async {
+    if (_sourceX == null || _sourceY == null) return;
+    _lastScanAt = DateTime.now();
+    _towers.clear();
+
+    final cx = _sourceX!, cy = _sourceY!;
+    const chunkSize = 13;
+
+    final minX = (cx - _radiusTiles).clamp(1, 1000);
+    final maxX = (cx + _radiusTiles).clamp(1, 1000);
+    final minY = (cy - _radiusTiles).clamp(1, 1000);
+    final maxY = (cy + _radiusTiles).clamp(1, 1000);
+    final startX = (minX ~/ chunkSize) * chunkSize;
+    final endX = (maxX ~/ chunkSize) * chunkSize;
+    final startY = (minY ~/ chunkSize) * chunkSize;
+    final endY = (maxY ~/ chunkSize) * chunkSize;
+
+    final chunks = <List<int>>[];
+    for (int x = startX; x <= endX; x += chunkSize) {
+      for (int y = startY; y <= endY; y += chunkSize) {
+        chunks.add([x, y, (x + chunkSize - 1).clamp(1, 1000), (y + chunkSize - 1).clamp(1, 1000)]);
+      }
     }
+    if (chunks.length > 40) chunks.removeRange(40, chunks.length);
+
+    _log('Scan ${chunks.length} chunks');
+    await _saveStatus('SCANNING', extra: '0/${chunks.length}');
+
+    final seen = <String>{};
+    int done = 0;
+    for (final chunk in chunks) {
+      try {
+        final resp = await _sendXtAndWaitAsync(
+          'gaa',
+          jsonEncode({'KID': kid, 'AX1': chunk[0], 'AY1': chunk[1], 'AX2': chunk[2], 'AY2': chunk[3]}),
+          responseCmd: 'gaa',
+          timeoutMs: 15000,
+          isAction: false,
+        );
+        if (resp.result == 0 && resp.payload != null) {
+          final data = jsonDecode(resp.payload!) as Map;
+          final ai = data['AI'] as List?;
+          if (ai != null) {
+            for (final entry in ai) {
+              if (entry is! List || entry.length < 3) continue;
+              if (int.tryParse(entry[0].toString()) != 2) continue;
+              final x = int.tryParse(entry[1].toString()) ?? 0;
+              final y = int.tryParse(entry[2].toString()) ?? 0;
+              final key = '$x,$y';
+              if (seen.contains(key)) continue;
+              seen.add(key);
+              final dx = (x - cx).toDouble();
+              final dy = (y - cy).toDouble();
+              _towers.add(_DesertTower(x: x, y: y, kid: kid, distance: sqrt(dx * dx + dy * dy)));
+            }
+          }
+        }
+      } catch (e) { _log('Scan chunk: $e'); }
+      done++;
+      await Future.delayed(Duration(milliseconds: 800 + Random().nextInt(400)));
+      await _saveStatus('SCANNING', extra: '$done/${chunks.length} · ${_towers.length} towers');
+    }
+    _log('Scan done: ${_towers.length} towers');
+    await _saveStatus('SCAN_DONE', extra: '${_towers.length} towers');
+  }
+
+  Future<_DesertSpyReport?> _spyAndFetch(_DesertTower tower) async {
+    _latestSpyMessageId = null;
+    try {
+      final resp = await _sendXtAndWaitAsync(
+        'csm',
+        jsonEncode({
+          'SID': _sourceAreaId,
+          'TX': tower.x, 'TY': tower.y,
+          'SC': 11, 'ST': 0, 'SE': 100,
+          'HBW': -1, 'KID': tower.kid, 'PTT': 1, 'SD': 0,
+        }),
+        responseCmd: 'csm',
+        timeoutMs: 25000,
+        isAction: true,
+      );
+      if (resp.result != 0) { _log('Spy failed: ${resp.result}'); return null; }
+    } catch (e) { _log('Spy: $e'); return null; }
+
+    int? msgId;
+    for (int i = 0; i < 15; i++) {
+      await Future.delayed(const Duration(seconds: 2));
+      msgId = _latestSpyMessageId;
+      if (msgId != null) break;
+    }
+    if (msgId == null) { _log('No sne'); return null; }
+
+    try {
+      _sendXt('mmr', jsonEncode({'MID': msgId}));
+      await Future.delayed(const Duration(milliseconds: 300));
+      final bsd = await _sendXtAndWaitAsync(
+        'bsd', jsonEncode({'MID': msgId}),
+        responseCmd: 'bsd', timeoutMs: 15000, isAction: false,
+      );
+      if (bsd.result != 0 || bsd.payload == null) { _log('bsd failed: ${bsd.result}'); return null; }
+      return _parseBsd(bsd.payload!, msgId, tower);
+    } catch (e) { _log('bsd: $e'); return null; }
+  }
+
+  _DesertSpyReport? _parseBsd(String payload, int messageId, _DesertTower tower) {
+    try {
+      final data = jsonDecode(payload) as Map;
+      final s = data['S'] as List?;
+      if (s == null || s.length < 3) return null;
+
+      _DefenderWing parseWing(dynamic w) {
+        int melee = 0, ranged = 0;
+        if (w is List) {
+          for (final u in w) {
+            if (u is! List || u.length < 2) continue;
+            final id = int.tryParse(u[0].toString()) ?? 0;
+            final amt = int.tryParse(u[1].toString()) ?? 0;
+            if (id <= 0 || amt <= 0) continue;
+            if (_rangedUnitIds.contains(id)) ranged += amt;
+            else melee += amt;
+          }
+        }
+        return _DefenderWing(melee: melee, ranged: ranged);
+      }
+
+      return _DesertSpyReport(
+        messageId: messageId,
+        targetX: tower.x, targetY: tower.y,
+        left: parseWing(s[0]),
+        middle: parseWing(s[1]),
+        right: parseWing(s[2]),
+        defensiveStrength: int.tryParse(data['AS']?.toString() ?? '') ?? 0,
+        rs: int.tryParse(data['RS']?.toString() ?? '') ?? 0,
+      );
+    } catch (e) { _log('parseBsd: $e'); return null; }
+  }
+
+  Future<bool> _tryAttackTower(_DesertTower tower) async {
+    _log('Trying ${tower.coordsLabel}');
+    await _saveStatus('SPYING', extra: tower.coordsLabel);
+
+    final report = await _spyAndFetch(tower);
+    if (report == null) { _markTowerFailed(tower); return false; }
+    if (report.isDead) { _log('dead RS=${report.rs}'); _markTowerFailed(tower); return false; }
+    if (report.totalEnemyUnits == 0) { _log('empty'); _markTowerFailed(tower); return false; }
+    if (report.totalEnemyUnits > 30) {
+      _log('too strong (${report.totalEnemyUnits})');
+      _markTowerFailed(tower);
+      return false;
+    }
+
     final units = await _fetchUnits();
-    _samuraiCachedUnits = units;
-    _samuraiUnitsFetchAt = DateTime.now();
-    return units;
+    if (units.isEmpty) { _log('no units'); return false; }
+
+    final army = _buildArmy(units, report);
+    if (army == null || army.total <= 0) {
+      _log('army build failed');
+      _markTowerFailed(tower);
+      return false;
+    }
+
+    try {
+      final payload = {
+        'SX': _sourceX, 'SY': _sourceY,
+        'TX': tower.x, 'TY': tower.y,
+        'KID': tower.kid, 'LID': 0,
+        'WT': 0, 'HBW': -1, 'BPC': 0, 'ATT': 0, 'AV': 0,
+        'LP': 0, 'FC': 0, 'PTT': 1, 'SD': 0, 'ICA': 0, 'CD': 99,
+        'A': [{
+          'L': {'T': [[-1, 0], [-1, 0]], 'U': _fill(army.left, 2)},
+          'R': {'T': [[-1, 0], [-1, 0]], 'U': _fill(army.right, 2)},
+          'M': {'T': [[-1, 0], [-1, 0], [-1, 0]], 'U': _fill(army.middle, 6)},
+        }],
+        'BKS': [], 'AST': [-1, -1, -1],
+        'RW': List.generate(8, (_) => [-1, 0]),
+        'ASCT': 0,
+      };
+      final resp = await _sendXtAndWaitAsync(
+        'cra', jsonEncode(payload),
+        responseCmd: 'cra', timeoutMs: 25000, isAction: true,
+      );
+      if (resp.result == 0) {
+        _log('✅ HIT ${tower.coordsLabel} (${army.total})');
+        _markTowerAttacked(tower);
+        return true;
+      }
+      _log('Attack failed: ${resp.result}');
+      if (resp.result == 218) {
+        _log('Lord busy, skip this tick');
+        return false;
+      }
+      _markTowerFailed(tower);
+      return false;
+    } catch (e) {
+      _log('Attack: $e');
+      _markTowerFailed(tower);
+      return false;
+    }
   }
 
   Future<Map<int, int>> _fetchUnits() async {
@@ -853,75 +997,253 @@ class _GgeTaskHandler extends TaskHandler {
         }
         return units;
       }
-    } catch (_) {}
+    } catch (e) { _log('gui: $e'); }
     return {};
   }
 
-  Future<Set<int>> _getActiveLords() async {
-    if (_samuraiCachedActiveLords != null &&
-        _samuraiActiveLordsFetchAt != null &&
-        DateTime.now().difference(_samuraiActiveLordsFetchAt!).inSeconds < 30) {
-      return _samuraiCachedActiveLords!;
+  _BgArmy? _buildArmy(Map<int, int> available, _DesertSpyReport report) {
+    final leftDef = report.left.total;
+    final middleDef = report.middle.total;
+    final rightDef = report.right.total;
+
+    final sorted = available.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+    final remaining = Map<int, int>.from(available);
+
+    List<List<int>> alloc(int def, {int maxSlots = 2}) {
+      if (def <= 0) return [];
+      final target = (def * 2.0).round();
+      final out = <List<int>>[];
+      int got = 0;
+      for (final e in sorted) {
+        if (got >= target || out.length >= maxSlots) break;
+        final rem = remaining[e.key] ?? 0;
+        if (rem <= 0) continue;
+        final need = target - got;
+        final take = need < rem ? need : rem;
+        if (take <= 0) continue;
+        out.add([e.key, take]);
+        remaining[e.key] = rem - take;
+        got += take;
+      }
+      return out;
     }
-    final active = <int>{};
+
+    final left = alloc(leftDef);
+    final middle = alloc(middleDef, maxSlots: 5);
+    final right = alloc(rightDef);
+    final total = left.fold<int>(0, (s, e) => s + e[1]) +
+        middle.fold<int>(0, (s, e) => s + e[1]) +
+        right.fold<int>(0, (s, e) => s + e[1]);
+    if (total == 0) return null;
+    return _BgArmy(left: left, middle: middle, right: right, total: total);
+  }
+
+  List<List<int>> _fill(List<List<int>> units, int count) {
+    final r = <List<int>>[];
+    for (int i = 0; i < count; i++) {
+      if (i < units.length && units[i][0] > 0 && units[i][1] > 0) {
+        r.add([units[i][0], units[i][1]]);
+      } else {
+        r.add([-1, 0]);
+      }
+    }
+    return r;
+  }
+
+  // ═══════════════════════════════════════════════════════
+  //  Samurai — Kingdom Switch
+  // ═══════════════════════════════════════════════════════
+  Future<int?> _ensureSamuraiKingdom() async {
+    if (_samuraiCurrentKid != null &&
+        _samuraiLastJcaAt != null &&
+        DateTime.now().difference(_samuraiLastJcaAt!).inMinutes < 5) {
+      return _samuraiCurrentKid;
+    }
+
+    int targetKid = _samuraiSourceKid ?? 1;
+    if (_samuraiSourceAreaId == null || _samuraiSourceAreaId == 0) {
+      return null;
+    }
+
     try {
       final resp = await _sendXtAndWaitAsync(
-        'gam', '{}',
-        responseCmd: 'gam', timeoutMs: 10000, isAction: false,
+        'jca',
+        jsonEncode({'CID': -1, 'KID': targetKid}),
+        responseCmd: 'jaa',
+        timeoutMs: 8000,
+        isAction: false,
       );
       if (resp.result == 0 && resp.payload != null) {
         final data = jsonDecode(resp.payload!) as Map;
-        final moves = data['M'] as List?;
-        if (moves != null) {
-          for (final m in moves) {
-            if (m is! Map) continue;
-            final mov = m['M'] as Map?;
-            final um = mov?['UM'] as Map?;
-            final l = um?['L'] as Map?;
-            final lid = int.tryParse(l?['ID']?.toString() ?? '') ?? 0;
-            if (lid > 0) active.add(lid);
+        final gca = data['gca'] as Map?;
+        if (gca != null) {
+          final a = gca['A'] as List?;
+          if (a != null && a.length > 3) {
+            _samuraiSourceX = int.tryParse(a[1].toString());
+            _samuraiSourceY = int.tryParse(a[2].toString());
+            _samuraiCurrentKid = targetKid;
+            _samuraiLastJcaAt = DateTime.now();
+
+            final o = gca['O'] as Map?;
+            if (o != null) {
+              final lvl = int.tryParse(o['L']?.toString() ?? '') ?? 0;
+              final ll = int.tryParse(o['LL']?.toString() ?? '') ?? 0;
+              _samuraiPlayerLevel = lvl + ll;
+            }
+            return targetKid;
           }
         }
       }
-    } catch (_) {}
-    _samuraiCachedActiveLords = active;
-    _samuraiActiveLordsFetchAt = DateTime.now();
-    return active;
-  }
-
-  Future<bool> _ensureSamuraiKingdom(int kid) async {
-    if (_samuraiLastJcaKid == kid &&
-        _samuraiLastJcaAt != null &&
-        DateTime.now().difference(_samuraiLastJcaAt!).inMinutes < 5) {
-      return true;
+    } catch (e) {
+      _log('Samurai jca: $e');
     }
-    try {
-      final resp = await _sendXtAndWaitAsync(
-        'jca', jsonEncode({'CID': -1, 'KID': kid}),
-        responseCmd: 'jaa', timeoutMs: 8000, isAction: false,
-      );
-      if (resp.result == 0) {
-        _samuraiLastJcaKid = kid;
-        _samuraiLastJcaAt = DateTime.now();
-        return true;
-      }
-    } catch (_) {}
-    return false;
+    return null;
   }
 
-  Future<void> _scanSamuraiCamps() async {
-    _lastSamuraiScanAt = DateTime.now();
+  // ═══════════════════════════════════════════════════════
+  //  Samurai — Timer / Tick
+  // ═══════════════════════════════════════════════════════
+  void _scheduleNextSamuraiTick() {
+    final seconds = 60 + Random().nextInt(30);
+    _samuraiTimer = Timer(Duration(seconds: seconds), () async {
+      if (!_runningSamurai) await _samuraiTick();
+      _scheduleNextSamuraiTick();
+    });
+  }
+
+  Future<void> _samuraiTick() async {
+    if (!_loggedIn || !_samuraiEnabled) return;
+    if (_samuraiSourceAreaId == null || _samuraiSourceAreaId == 0) return;
+
+    final today = _todayStr();
+    if (_samuraiAttacksDate != today) {
+      _samuraiAttacksToday = 0;
+      _samuraiAttacksDate = today;
+      await _persistSamuraiState();
+    }
+
+    if (_samuraiMaxAttacksDay > 0 &&
+        _samuraiAttacksToday >= _samuraiMaxAttacksDay) {
+      await _saveStatus('SAMURAI_LIMIT',
+          extra: '$_samuraiAttacksToday/$_samuraiMaxAttacksDay');
+      return;
+    }
+
+    _runningSamurai = true;
+    try {
+      final kid = await _ensureSamuraiKingdom();
+      if (kid == null) {
+        _log('Samurai: jca failed');
+        return;
+      }
+
+      await _saveStatus('SAMURAI_RUN',
+          extra: '$_samuraiAttacksToday/$_samuraiMaxAttacksDay');
+
+      if (_samuraiCamps.isEmpty ||
+          (_samuraiLastScanAt != null &&
+              DateTime.now()
+                      .difference(_samuraiLastScanAt!)
+                      .inMinutes >
+                  _kSamuraiScanCacheMin)) {
+        await _scanSamuraiCamps(kid);
+      }
+      if (_samuraiCamps.isEmpty) return;
+
+      int attacksThisTick = 0;
+      int failStreak = 0;
+      const int maxAttacks = 20;
+      const int maxFailStreak = 5;
+      const int mainLordId = 0;
+
+      while (_samuraiEnabled &&
+          _loggedIn &&
+          attacksThisTick < maxAttacks &&
+          failStreak < maxFailStreak) {
+        final units = await _fetchUnits();
+        final offensive = <int, int>{};
+        for (final e in units.entries) {
+          if (_isOffensiveSamuraiUnit(e.key, e.value)) {
+            offensive[e.key] = e.value;
+          }
+        }
+        final totalUnits =
+            offensive.values.fold<int>(0, (s, v) => s + v);
+
+        if (totalUnits < _samuraiMinUnits) {
+          _log('Samurai: units $totalUnits < $_samuraiMinUnits');
+          break;
+        }
+
+        final pool = _buildSamuraiPool();
+        if (pool.isEmpty) {
+          _log('Samurai: all camps failed');
+          break;
+        }
+
+        bool attacked = false;
+        for (final camp in pool) {
+          final toolChoice = _pickSamuraiTool(units, camp);
+          final ok = await _attackSamuraiCamp(
+            camp: camp,
+            lordId: mainLordId,
+            units: offensive,
+            toolId: toolChoice,
+          );
+
+          if (ok) {
+            attacksThisTick++;
+            _samuraiAttacksToday++;
+            await _persistSamuraiState();
+            failStreak = 0;
+            attacked = true;
+
+            await _saveStatus('SAMURAI_HIT',
+                extra:
+                    '${camp.coordsLabel} · $_samuraiAttacksToday/$_samuraiMaxAttacksDay');
+
+            final gapMs = 3000 + Random().nextInt(2000);
+            await Future.delayed(Duration(milliseconds: gapMs));
+            break;
+          }
+
+          failStreak++;
+          _samuraiFailedCamps[camp.key] = DateTime.now()
+              .add(Duration(minutes: _kSamuraiFailedCooldownMin));
+          await _persistSamuraiState();
+
+          if (failStreak >= maxFailStreak) break;
+          await Future.delayed(const Duration(seconds: 2));
+        }
+
+        if (!attacked) break;
+      }
+
+      _log('Samurai tick done: $attacksThisTick attacks');
+    } catch (e) {
+      _log('Samurai tick error: $e');
+    } finally {
+      _runningSamurai = false;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════
+  //  Samurai — Scan
+  // ═══════════════════════════════════════════════════════
+  Future<void> _scanSamuraiCamps(int kid) async {
+    if (_samuraiSourceX == null || _samuraiSourceY == null) return;
+    _samuraiLastScanAt = DateTime.now();
     _samuraiCamps.clear();
 
-    final cx = _samuraiSourceX;
-    final cy = _samuraiSourceY;
-    const radiusTiles = 30;
-    const chunkSize = 13;
+    final cx = _samuraiSourceX!, cy = _samuraiSourceY!;
+    const chunkSize = _kSamuraiChunkSize;
 
-    final minX = (cx - radiusTiles).clamp(1, 1000);
-    final maxX = (cx + radiusTiles).clamp(1, 1000);
-    final minY = (cy - radiusTiles).clamp(1, 1000);
-    final maxY = (cy + radiusTiles).clamp(1, 1000);
+    final minX = (cx - _samuraiRadius).clamp(1, 1000);
+    final maxX = (cx + _samuraiRadius).clamp(1, 1000);
+    final minY = (cy - _samuraiRadius).clamp(1, 1000);
+    final maxY = (cy + _samuraiRadius).clamp(1, 1000);
+
     final startX = (minX ~/ chunkSize) * chunkSize;
     final endX = (maxX ~/ chunkSize) * chunkSize;
     final startY = (minY ~/ chunkSize) * chunkSize;
@@ -930,28 +1252,36 @@ class _GgeTaskHandler extends TaskHandler {
     final chunks = <List<int>>[];
     for (int x = startX; x <= endX; x += chunkSize) {
       for (int y = startY; y <= endY; y += chunkSize) {
-        chunks.add([x, y, (x + chunkSize - 1).clamp(1, 1000), (y + chunkSize - 1).clamp(1, 1000)]);
+        chunks.add([
+          x, y,
+          (x + chunkSize - 1).clamp(1, 1000),
+          (y + chunkSize - 1).clamp(1, 1000),
+        ]);
       }
     }
     if (chunks.length > 40) chunks.removeRange(40, chunks.length);
 
     _log('Samurai scan ${chunks.length} chunks');
-    await _saveSamuraiStatus('SCANNING', extra: '0/${chunks.length}');
+    await _saveStatus('SAMURAI_SCANNING',
+        extra: '0/${chunks.length}');
 
     final seen = <String>{};
     int done = 0;
-    int skippedDaimyo = 0;
+
     for (final chunk in chunks) {
       try {
         final resp = await _sendXtAndWaitAsync(
           'gaa',
           jsonEncode({
-            'KID': _samuraiSourceKid,
+            'KID': kid,
             'AX1': chunk[0], 'AY1': chunk[1],
             'AX2': chunk[2], 'AY2': chunk[3],
           }),
-          responseCmd: 'gaa', timeoutMs: 15000, isAction: false,
+          responseCmd: 'gaa',
+          timeoutMs: 15000,
+          isAction: false,
         );
+
         if (resp.result == 0 && resp.payload != null) {
           final data = jsonDecode(resp.payload!) as Map;
           final ai = data['AI'] as List?;
@@ -959,10 +1289,9 @@ class _GgeTaskHandler extends TaskHandler {
             for (final entry in ai) {
               if (entry is! List || entry.length < 3) continue;
               final type = int.tryParse(entry[0].toString()) ?? 0;
-              if (type != 29 && type != 37 && type != 38) continue;
-
-              if (_samuraiSkipDaimyo && (type == 37 || type == 38)) {
-                skippedDaimyo++;
+              if (!_kAllSamuraiTypes.contains(type)) continue;
+              if (_kDaimyoCastleTypes.contains(type) &&
+                  _samuraiSkipDaimyo) {
                 continue;
               }
 
@@ -970,198 +1299,247 @@ class _GgeTaskHandler extends TaskHandler {
               final y = int.tryParse(entry[2].toString()) ?? 0;
               final key = '$x,$y';
               if (seen.contains(key)) continue;
-              seen.add(key);
 
-              int hp = 0, level = 0, l2 = 0, ownerId = -1;
-              if (entry.length > 3) ownerId = int.tryParse(entry[3].toString()) ?? -1;
-              if (type == 29) {
-                if (entry.length > 9) level = int.tryParse(entry[9].toString()) ?? 0;
-                if (entry.length > 10) l2 = int.tryParse(entry[10].toString()) ?? 0;
-                if (level <= 0 && l2 > 0) level = l2;
-              } else {
-                if (entry.length > 8) hp = int.tryParse(entry[8].toString()) ?? 0;
-                if (entry.length > 9) level = int.tryParse(entry[9].toString()) ?? 0;
-                if (entry.length > 10) l2 = int.tryParse(entry[10].toString()) ?? 0;
-                if (level <= 0 && l2 > 0) level = l2;
+              final ownerId = entry.length > 3
+                  ? (int.tryParse(entry[3].toString()) ?? -1)
+                  : -1;
+              int hp = 0, level = 0, level2 = 0;
+              if (entry.length > 8) {
+                hp = int.tryParse(entry[8].toString()) ?? 0;
               }
+              if (entry.length > 9) {
+                level = int.tryParse(entry[9].toString()) ?? 0;
+              }
+              if (entry.length > 10) {
+                level2 = int.tryParse(entry[10].toString()) ?? 0;
+              }
+              if (level <= 0 && level2 > 0) level = level2;
 
+              if (_samuraiMaxLevel > 0 && level > _samuraiMaxLevel) {
+                continue;
+              }
               if (ownerId != -1) continue;
-              if (level > _samuraiMaxLevel) continue;
 
+              seen.add(key);
               final dx = (x - cx).toDouble();
               final dy = (y - cy).toDouble();
+
               _samuraiCamps.add(_SamuraiCamp(
-                x: x, y: y, kid: _samuraiSourceKid,
-                type: type, hp: hp, level: level,
+                x: x, y: y, kid: kid,
+                type: type, hp: hp,
+                level: level, level2: level2,
+                ownerId: ownerId,
                 distance: sqrt(dx * dx + dy * dy),
               ));
             }
           }
         }
-      } catch (_) {}
+      } catch (e) {
+        _log('Samurai scan chunk: $e');
+      }
       done++;
-      await Future.delayed(Duration(milliseconds: 800 + Random().nextInt(400)));
-      await _saveSamuraiStatus('SCANNING',
-          extra: '$done/${chunks.length} · ${_samuraiCamps.length}');
+      await Future.delayed(
+          Duration(milliseconds: 800 + Random().nextInt(400)));
+      await _saveStatus('SAMURAI_SCANNING',
+          extra: '$done/${chunks.length} · ${_samuraiCamps.length} camps');
     }
-    _log('Samurai scan done: ${_samuraiCamps.length} camps · Daimyo skipped: $skippedDaimyo');
-    await _saveSamuraiStatus('SCAN_DONE',
+
+    _log('Samurai scan done: ${_samuraiCamps.length} camps');
+    await _saveStatus('SAMURAI_SCAN_DONE',
         extra: '${_samuraiCamps.length} camps');
   }
 
-  _SamuraiCamp? _findSamuraiTarget() {
+  // ═══════════════════════════════════════════════════════
+  //  Samurai — Pool / Tool / Attack
+  // ═══════════════════════════════════════════════════════
+  List<_SamuraiCamp> _buildSamuraiPool() {
     final now = DateTime.now();
-    final candidates = <_SamuraiCamp>[];
-    for (final c in _samuraiCamps) {
-      if (c.isDead) continue;
-      final cd = _samuraiCooldowns[c.key];
-      if (cd != null && cd.isAfter(now)) continue;
-      final fail = _samuraiFailedCamps[c.key];
-      if (fail != null && fail.isAfter(now)) continue;
-      if (c.level > _samuraiMaxLevel) continue;
-      candidates.add(c);
-    }
-    if (candidates.isEmpty) return null;
-    candidates.sort((a, b) => a.distance.compareTo(b.distance));
-    return candidates.first;
+    return _samuraiCamps
+        .where((c) => !c.isDead)
+        .where((c) => !c.isPlayerCamp)
+        .where((c) => !(_samuraiSkipDaimyo && c.isDaimyoCastle))
+        .where((c) {
+          final fail = _samuraiFailedCamps[c.key];
+          return fail == null || !fail.isAfter(now);
+        })
+        .toList()
+      ..shuffle();
   }
 
-  Future<String> _attackSamuraiCamp(
-    _SamuraiCamp camp, int lordId, List<MapEntry<int, int>> offensive,
-  ) async {
-    final lvl = camp.level > 0 ? camp.level : 30;
-    final maxAttackers = lvl <= 69 ? min(260, 5 * lvl + 8) : 320;
-    final rawFlank = (maxAttackers * 0.2).ceil().clamp(1, 42);
-    final rawMiddle = (maxAttackers - 2 * rawFlank).clamp(1, 124);
+  int? _pickSamuraiTool(Map<int, int> units, _SamuraiCamp camp) {
+    final needed = _samuraiToolL + _samuraiToolR + _samuraiToolM;
+    if (needed <= 0) return null;
 
-    final available = <int, int>{};
-    for (final e in offensive) available[e.key] = e.value;
-
-    final payloadWithTools = _buildSamuraiPayload(
-      camp: camp, lordId: lordId,
-      available: Map.from(available),
-      rawFlank: rawFlank, rawMiddle: rawMiddle,
-      useTools: true,
-    );
-    if (payloadWithTools == null) return 'no_units';
-
-    var resp = await _sendSamuraiCra(payloadWithTools);
-    if (resp.result == 0) {
-      _samuraiCooldowns[camp.key] = DateTime.now().add(const Duration(minutes: 5));
-      _samuraiAttacksToday++;
-      _samuraiAttacksSession++;
-      await _persistSamuraiState();
-      _log('✅ HIT ${camp.coordsLabel} · L$lordId');
-      return 'success';
+    final primary = _samuraiToolId;
+    if (primary != null && primary > 0) {
+      final have = units[primary] ?? 0;
+      if (have >= needed) return primary;
+      _log('Samurai: tool $primary short ($have < $needed)');
     }
 
-    _log('Attempt failed: ${resp.result}');
-
-    if (resp.result == 313 || resp.result == 91 || resp.result == 100) {
-      final payloadNoTools = _buildSamuraiPayload(
-        camp: camp, lordId: lordId,
-        available: Map.from(available),
-        rawFlank: rawFlank, rawMiddle: rawMiddle,
-        useTools: false,
-      );
-      if (payloadNoTools != null) {
-        resp = await _sendSamuraiCra(payloadNoTools);
-        if (resp.result == 0) {
-          _samuraiCooldowns[camp.key] =
-              DateTime.now().add(const Duration(minutes: 5));
-          _samuraiAttacksToday++;
-          _samuraiAttacksSession++;
-          await _persistSamuraiState();
-          _log('✅ HIT (no tools) ${camp.coordsLabel}');
-          return 'success';
-        }
+    final fallback = _samuraiFallbackToolId;
+    if (fallback != null && fallback > 0 && fallback != primary) {
+      final have = units[fallback] ?? 0;
+      if (have >= needed) {
+        _log('Samurai: fallback tool $fallback');
+        return fallback;
       }
     }
 
-    if (resp.result == 6) {
-      _samuraiFailedCamps[camp.key] = DateTime.now().add(const Duration(hours: 2));
-      return 'target_rejected';
-    }
-    if (resp.result == 256 || resp.result == 218 || resp.result == 404) {
-      return 'lord_busy';
-    }
-    _samuraiFailedCamps[camp.key] = DateTime.now().add(const Duration(minutes: 15));
-    return 'error:${resp.result}';
+    _log('Samurai: no tools → attacking without');
+    return null;
   }
 
-  Map<String, dynamic>? _buildSamuraiPayload({
+  Future<bool> _attackSamuraiCamp({
     required _SamuraiCamp camp,
     required int lordId,
-    required Map<int, int> available,
-    required int rawFlank,
-    required int rawMiddle,
-    required bool useTools,
-  }) {
-    final sorted = available.entries.where((e) => e.value > 0).toList()
+    required Map<int, int> units,
+    int? toolId,
+  }) async {
+    final level = camp.effectiveLevel;
+    if (level <= 0) {
+      _log('Samurai: level unknown ${camp.coordsLabel}');
+      return false;
+    }
+
+    if (_samuraiPlayerLevel > 0) {
+      final diff = level - _samuraiPlayerLevel;
+      if (diff > 15) {
+        _log('Samurai: level diff $diff > 15');
+        return false;
+      }
+    }
+
+    final maxAttackers =
+        level <= 69 ? min(260, 5 * level + 8) : 320;
+    final flankMax = (0.2 * maxAttackers).ceil();
+    final middleMax = maxAttackers - 2 * flankMax;
+    final maxFlankUnits = min(flankMax, 42);
+    final maxMiddleUnits = min(middleMax, 124);
+
+    final maxFlankTools =
+        level < 37 ? 10 : level < 50 ? 20 : level < 69 ? 30 : 40;
+    final maxMiddleTools =
+        level < 11 ? 10 : level < 37 ? 20 : level < 50 ? 30 :
+        level < 69 ? 40 : 50;
+
+    final combat = units.entries
+        .where((e) => e.value > 0)
+        .toList()
       ..sort((a, b) => b.value.compareTo(a.value));
-    final remaining = Map<int, int>.from(available);
-    final waves = <Map<String, dynamic>>[];
-    final wavesCount = _samuraiWaves.clamp(1, 3);
 
-    for (int w = 0; w < wavesCount; w++) {
-      final lU = _allocUnits(remaining, sorted, rawFlank, 2);
-      final rU = _allocUnits(remaining, sorted, rawFlank, 2);
-      final mU = _allocUnits(remaining, sorted, rawMiddle, 6);
-      final sum = _sumUnits(lU) + _sumUnits(rU) + _sumUnits(mU);
-      if (sum == 0) break;
+    if (combat.isEmpty) {
+      _log('Samurai: no combat units');
+      return false;
+    }
 
-      List<List<int>> lT, rT, mT;
-      if (useTools) {
-        lT = _makeTools(_samuraiToolL, 2);
-        rT = _makeTools(_samuraiToolR, 2);
-        mT = _makeTools(_samuraiToolM, 3);
+    final waveCount = _samuraiWaves.clamp(1, 3);
+    final remaining = Map<int, int>.from(units);
+
+    final wavesPayload = <Map<String, dynamic>>[];
+    int totalSent = 0;
+    int toolsUsed = 0;
+
+    for (int w = 0; w < waveCount; w++) {
+      final leftUnits =
+          _fillSamuraiUnits(remaining, combat, maxFlankUnits, 2);
+      final rightUnits =
+          _fillSamuraiUnits(remaining, combat, maxFlankUnits, 2);
+      final midUnits =
+          _fillSamuraiUnits(remaining, combat, maxMiddleUnits, 6);
+
+      final waveSum = _sumUnits(leftUnits) +
+          _sumUnits(rightUnits) +
+          _sumUnits(midUnits);
+      if (waveSum == 0) break;
+      totalSent += waveSum;
+
+      List<List<int>> leftTools, rightTools, midTools;
+      if (toolId != null) {
+        leftTools =
+            _fillSamuraiTools(toolId, _samuraiToolL, 2, maxFlankTools);
+        rightTools =
+            _fillSamuraiTools(toolId, _samuraiToolR, 2, maxFlankTools);
+        midTools =
+            _fillSamuraiTools(toolId, _samuraiToolM, 3, maxMiddleTools);
+        toolsUsed += _sumTools(leftTools) +
+            _sumTools(rightTools) +
+            _sumTools(midTools);
       } else {
-        lT = List.generate(2, (_) => [-1, 0]);
-        rT = List.generate(2, (_) => [-1, 0]);
-        mT = List.generate(3, (_) => [-1, 0]);
+        leftTools = List.generate(2, (_) => [-1, 0]);
+        rightTools = List.generate(2, (_) => [-1, 0]);
+        midTools = List.generate(3, (_) => [-1, 0]);
       }
 
-      waves.add({
-        'L': {'T': lT, 'U': lU},
-        'R': {'T': rT, 'U': rU},
-        'M': {'T': mT, 'U': mU},
+      wavesPayload.add({
+        'L': {'T': leftTools, 'U': leftUnits},
+        'R': {'T': rightTools, 'U': rightUnits},
+        'M': {'T': midTools, 'U': midUnits},
       });
     }
 
-    if (waves.isEmpty) return null;
+    if (wavesPayload.isEmpty) return false;
 
-    return {
+    final payload = {
       'SX': _samuraiSourceX, 'SY': _samuraiSourceY,
       'TX': camp.x, 'TY': camp.y,
       'KID': camp.kid, 'LID': lordId,
       'WT': 0, 'HBW': -1, 'BPC': 0, 'ATT': 0, 'AV': 0,
       'LP': 0, 'FC': 0, 'PTT': 1, 'SD': 0, 'ICA': 0, 'CD': 99,
-      'A': waves,
+      'A': wavesPayload,
       'BKS': [],
       'AST': [-1, -1, -1],
       'RW': List.generate(8, (_) => [-1, 0]),
       'ASCT': 0,
     };
-  }
 
-  List<List<int>> _makeTools(int amount, int slots) {
-    if (_samuraiToolId <= 0 || amount <= 0) {
-      return List.generate(slots, (_) => [-1, 0]);
+    try {
+      final resp = await _sendXtAndWaitAsync(
+        'cra',
+        jsonEncode(payload),
+        responseCmd: 'cra',
+        timeoutMs: 25000,
+        isAction: true,
+      );
+
+      if (resp.result == 0) {
+        _log('Samurai ✅ ${camp.coordsLabel} '
+             'units=$totalSent tools=$toolsUsed');
+        return true;
+      }
+
+      _log('Samurai ❌ ${camp.coordsLabel} code=${resp.result}');
+
+      if (resp.result == 6) {
+        _samuraiFailedCamps[camp.key] =
+            DateTime.now().add(const Duration(hours: 2));
+        await _persistSamuraiState();
+      }
+      return false;
+    } catch (e) {
+      _log('Samurai attack: $e');
+      return false;
     }
-    final out = List.generate(slots, (_) => <int>[-1, 0]);
-    out[0] = [_samuraiToolId, amount];
-    return out;
   }
 
-  List<List<int>> _allocUnits(
+  // ═══════════════════════════════════════════════════════
+  //  Samurai — Helpers
+  // ═══════════════════════════════════════════════════════
+  bool _isOffensiveSamuraiUnit(int wodId, int amount) {
+    if (amount <= 0) return false;
+    if (_kDefensiveWodIds.contains(wodId)) return false;
+    return true;
+  }
+
+  List<List<int>> _fillSamuraiUnits(
     Map<int, int> remaining,
-    List<MapEntry<int, int>> sorted,
+    List<MapEntry<int, int>> pool,
     int maxTotal,
     int slots,
   ) {
     final out = <List<int>>[];
     int allocated = 0;
-    for (final e in sorted) {
+    for (final e in pool) {
       if (allocated >= maxTotal || out.length >= slots) break;
       final rem = remaining[e.key] ?? 0;
       if (rem <= 0) continue;
@@ -1175,23 +1553,28 @@ class _GgeTaskHandler extends TaskHandler {
     return out;
   }
 
+  List<List<int>> _fillSamuraiTools(
+      int toolId, int total, int slots, int cap) {
+    if (toolId <= 0 || total <= 0) {
+      return List.generate(slots, (_) => [-1, 0]);
+    }
+    final effective = total.clamp(0, cap);
+    if (effective <= 0) {
+      return List.generate(slots, (_) => [-1, 0]);
+    }
+    final out = List.generate(slots, (_) => [-1, 0]);
+    out[0] = [toolId, effective];
+    return out;
+  }
+
   int _sumUnits(List<List<int>> u) =>
       u.fold<int>(0, (s, e) => s + (e[0] > 0 ? e[1] : 0));
-
-  Future<_XtMsg> _sendSamuraiCra(Map<String, dynamic> payload) async {
-    try {
-      return await _sendXtAndWaitAsync(
-        'cra', jsonEncode(payload),
-        responseCmd: 'cra', timeoutMs: 25000, isAction: true,
-      );
-    } catch (e) {
-      return _XtMsg('cra', -1, null);
-    }
-  }
+  int _sumTools(List<List<int>> u) =>
+      u.fold<int>(0, (s, e) => s + (e[0] > 0 ? e[1] : 0));
 }
 
 // ═══════════════════════════════════════════════════════════
-//  BackgroundService static class
+//  BackgroundService
 // ═══════════════════════════════════════════════════════════
 class BackgroundService {
   BackgroundService._();
@@ -1210,8 +1593,7 @@ class BackgroundService {
         priority: NotificationPriority.LOW,
         onlyAlertOnce: true,
       ),
-      iosNotificationOptions: const IOSNotificationOptions(
-          showNotification: false, playSound: false),
+      iosNotificationOptions: const IOSNotificationOptions(showNotification: false, playSound: false),
       foregroundTaskOptions: ForegroundTaskOptions(
         eventAction: ForegroundTaskEventAction.repeat(60000),
         autoRunOnBoot: false,
@@ -1246,20 +1628,6 @@ class BackgroundService {
     }
   }
 
-  /// ✅ restart للـ service عشان يقرأ settings جديدة
-  static Future<bool> restart() async {
-    try {
-      if (_running) {
-        await FlutterForegroundTask.stopService();
-        _running = false;
-        await Future.delayed(const Duration(milliseconds: 500));
-      }
-      return await start();
-    } catch (_) {
-      return false;
-    }
-  }
-
   static Future<void> stop() async {
     if (!_running) return;
     try { await FlutterForegroundTask.stopService(); } catch (_) {}
@@ -1272,17 +1640,6 @@ class BackgroundService {
       final status = await FlutterForegroundTask.getData<String>(key: 'bg_status');
       final time = await FlutterForegroundTask.getData<String>(key: 'bg_time');
       final extra = await FlutterForegroundTask.getData<String>(key: 'bg_extra');
-      return {'status': status ?? 'never ran', 'time': time ?? '?', 'extra': extra ?? ''};
-    } catch (e) {
-      return {'status': 'read error: $e', 'time': '?', 'extra': ''};
-    }
-  }
-
-  static Future<Map<String, dynamic>> readSamuraiStatus() async {
-    try {
-      final status = await FlutterForegroundTask.getData<String>(key: 'bg_samurai_status');
-      final time = await FlutterForegroundTask.getData<String>(key: 'bg_samurai_time');
-      final extra = await FlutterForegroundTask.getData<String>(key: 'bg_samurai_extra');
       return {'status': status ?? 'never ran', 'time': time ?? '?', 'extra': extra ?? ''};
     } catch (e) {
       return {'status': 'read error: $e', 'time': '?', 'extra': ''};

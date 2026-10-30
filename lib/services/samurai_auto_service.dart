@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 import 'package:flutter/foundation.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../gge_client.dart';
 import '../models.dart';
@@ -31,7 +32,7 @@ class SamuraiAutoService {
   static const _kToolM = 'samurai_auto_tool_m';
   static const _kWaves = 'samurai_auto_waves';
   static const _kMaxLevel = 'samurai_auto_max_level';
-  static const _kSkipDaimyo = 'samurai_auto_skip_daimyo';
+  static const _kSkipDaimyo = 'samurai_skip_daimyo_v1';
   static const _kDelayMin = 'samurai_auto_delay_min';
   static const _kDelayMax = 'samurai_auto_delay_max';
   static const _kMaxAttacksDay = 'samurai_auto_max_attacks_day';
@@ -52,12 +53,9 @@ class SamuraiAutoService {
   static const int kDefDelayMax = 15;
   static const int kDefMaxAttacksDay = 0;
 
-  // ✅ radius البحث (5 تيلز)
   static const int kCampsScanRadius = 5;
-  // ✅ كل 5 دقايق يعيد البحث
   static const int kCampsScanCacheMin = 5;
   static const int kFailedCampCooldownMin = 30;
-  // ⚠️ لم يعد مستخدمًا
   static const int kSuccessCooldownMin = 5;
 
   static const Set<int> kDefensiveWodIds = {1, 2, 3, 4, 5, 6, 7, 8};
@@ -215,6 +213,15 @@ class SamuraiAutoService {
       return;
     }
 
+    // ✅ لو Background شغال، متبدأش (هو المسؤول عن الهجمات)
+    final bgRunning = await FlutterForegroundTask.isRunningService;
+    if (bgRunning) {
+      TrafficLog.add('ST',
+          '[Samurai-Auto] ⚠️ Background service active — local attacks disabled');
+      _setStatus('💤 Background handles attacks');
+      return;
+    }
+
     if (_activeTick != null) {
       TrafficLog.add('ST', '[Samurai-Auto] ⏳ waiting for old tick...');
       try { await _activeTick!.timeout(const Duration(seconds: 60)); } catch (_) {}
@@ -236,8 +243,8 @@ class SamuraiAutoService {
     }
 
     _running = true;
-    _setStatus('🚀 Started');
-    TrafficLog.add('ST', '[Samurai-Auto] 🚀 Started');
+    _setStatus('🚀 Started (foreground only)');
+    TrafficLog.add('ST', '[Samurai-Auto] 🚀 Started (foreground mode)');
     _tick();
 
     _timer?.cancel();
@@ -310,8 +317,6 @@ class SamuraiAutoService {
     await p.setString(_kFailedCamps, jsonEncode(data));
   }
 
-  /// 🧹 امسح كل الـ state (cooldowns + failedCamps)
-  /// استخدمها لو كل الأبراج بقت blocked ومش عايز تستنى
   Future<void> clearAllState() async {
     _cooldowns.clear();
     _failedCamps.clear();
@@ -344,6 +349,13 @@ class SamuraiAutoService {
       return;
     }
     if (_client == null || _svc == null) return;
+
+    // ✅ لو Background شغال، هو المسؤول
+    final bgRunning = await FlutterForegroundTask.isRunningService;
+    if (bgRunning) {
+      _setStatus('💤 Background service active');
+      return;
+    }
 
     const initialStatus = '⏱️ Checking...';
     _setStatus(initialStatus);
@@ -416,7 +428,7 @@ class SamuraiAutoService {
     }
   }
 
-  // ═══ Attack Loop ═══
+  // ═══ Attack Loop (fallback فقط لما Background مقفول) ═══
   Future<void> _tryAttackCamps() async {
     if (_client == null || _svc == null) return;
 
@@ -442,7 +454,6 @@ class SamuraiAutoService {
       int attacksThisTick = 0;
       int failStreak = 0;
 
-      // ─── بناء pool قابل للاستخدام (shuffled round-robin) ───
       List<SamuraiCamp> buildPool() {
         final now = DateTime.now();
         return _camps
@@ -466,7 +477,6 @@ class SamuraiAutoService {
       }
 
       while (_running && attacksThisTick < safetyMaxAttacks) {
-        // ─── 🔄 REFRESH units + lords ───
         final castles = await _client!.getCastles();
         OwnedCastle? source;
         for (final c in castles) {
@@ -485,7 +495,6 @@ class SamuraiAutoService {
             .toList();
         final totalUnits = sendable.fold<int>(0, (s, u) => s + u.amount);
 
-        // ═══ STOP: الجنود خلصت ═══
         if (totalUnits < minUnits) {
           _setStatus('💤 Idle — units: $totalUnits (< $minUnits)');
           if (attacksThisTick > 0) {
@@ -502,8 +511,6 @@ class SamuraiAutoService {
               .where((c) => selectedCmds.contains(c.lord.id))
               .toList();
         }
-
-        // ═══ STOP: كل القواد مشغولين ═══
         if (freeLords.isEmpty) {
           _setStatus('💤 Idle — no free commanders');
           if (attacksThisTick > 0) {
@@ -513,7 +520,6 @@ class SamuraiAutoService {
           return;
         }
 
-        // ─── pool فضي؟ اعمله rebuild (round-robin) ───
         if (pool.isEmpty) {
           pool = buildPool();
           if (pool.isEmpty) {
@@ -528,7 +534,6 @@ class SamuraiAutoService {
               '[Samurai-Auto] 🔄 New round: ${pool.length} camps');
         }
 
-        // ─── اسحب camp من الـ pool ───
         final camp = pool.removeAt(0);
 
         final config = SamuraiAttackConfig(
@@ -540,7 +545,6 @@ class SamuraiAutoService {
           attackDaimyoCastles: !skipDaimyo,
         );
 
-        // ─── محاولة الهجوم ───
         bool attacked = false;
         for (final lordInfo in freeLords) {
           _setStatus(
@@ -558,7 +562,6 @@ class SamuraiAutoService {
             markCooldownAfterSuccess: false,
           );
 
-          // ═══ نجح ═══
           if (result.success) {
             attacksThisTick++;
             attacksThisSession++;
@@ -569,7 +572,6 @@ class SamuraiAutoService {
                 'units=${result.totalUnits} (#$attacksThisTick)');
             _setStatus('✅ Hit ${camp.coordsLabel}! (#$attacksThisTick)');
 
-            // فاصل 3-5 ثواني
             final gapMs = 3000 + Random().nextInt(2000);
             TrafficLog.add('ST',
                 '[Samurai-Auto] ⏱ gap ${gapMs}ms');
@@ -579,27 +581,23 @@ class SamuraiAutoService {
             break;
           }
 
-          // ═══ فشل ═══
           final err = result.error ?? '';
 
-          // لورد مشغول → جرّب لورد تاني على نفس الـ camp
           if (err.contains('256') ||
               err.contains('218') ||
               err.contains('LORD_BUSY')) {
             continue;
           }
 
-          // رفض نهائي → احجبه (ساعتين)
           if (err.contains('CRA 6') || err.contains('TARGET_REJECTED')) {
             _failedCamps[camp.key] =
                 DateTime.now().add(const Duration(hours: 2));
             await _saveFailedCamps();
             TrafficLog.add('ER',
-                '[Samurai-Auto] ⛔ ${camp.coordsLabel}: $err (blocked 2h)');
+                '[Samurai-Auto] ⛔ ${camp.coordsLabel}: $err (2h)');
             break;
           }
 
-          // أي فشل تاني → سجله بس متحجبهوش (هيرجع للـ pool تاني)
           TrafficLog.add('ER',
               '[Samurai-Auto] ❌ ${camp.coordsLabel}: $err (will retry)');
           break;
