@@ -16,13 +16,13 @@ const int kSamuraiRadiusStep = 10;
 const int kSamuraiDefaultRadius = 30;
 const int kSamuraiDefaultCooldownMin = 5;
 
-// ✅ حدود آمنة (مبنية على level 40 — نجحت فعليًا في البوت)
+const Set<int> kDefensiveUnitWodIds = {
+  1, 2, 3, 4, 5, 6, 7, 8, 9,
+};
+
 const int kSafeMaxFlankUnits = 42;
 const int kSafeMaxMiddleUnits = 124;
 
-// ═══════════════════════════════════════════════════
-//  Level-based formulas
-// ═══════════════════════════════════════════════════
 class SamuraiMath {
   static int maxAttackers(int lvl) {
     if (lvl <= 69) {
@@ -31,17 +31,14 @@ class SamuraiMath {
     }
     return 320;
   }
-
   static int flankMax(int lvl) => (0.2 * maxAttackers(lvl)).ceil();
   static int middleMax(int lvl) => maxAttackers(lvl) - 2 * flankMax(lvl);
-
   static int toolCapFlank(int lvl) {
     if (lvl < 37) return 10;
     if (lvl < 50) return 20;
     if (lvl < 69) return 30;
     return 40;
   }
-
   static int toolCapMiddle(int lvl) {
     if (lvl < 11) return 10;
     if (lvl < 37) return 20;
@@ -49,7 +46,6 @@ class SamuraiMath {
     if (lvl < 69) return 40;
     return 50;
   }
-
   static int wavesUnlocked(int playerLvl) {
     if (playerLvl >= 51) return 4;
     if (playerLvl >= 26) return 3;
@@ -59,7 +55,7 @@ class SamuraiMath {
 }
 
 // ═══════════════════════════════════════════════════
-//  إعدادات أمر الهجوم
+//  إعدادات أمر الهجوم (تم إصلاح copyWith)
 // ═══════════════════════════════════════════════════
 class SamuraiAttackConfig {
   final int waves;
@@ -83,9 +79,10 @@ class SamuraiAttackConfig {
 
   SamuraiAttackConfig copyWith({
     int? waves, int? toolId, int? toolL, int? toolR, int? toolM,
+    bool clearToolId = false,
   }) => SamuraiAttackConfig(
         waves: waves ?? this.waves,
-        toolId: toolId ?? this.toolId,
+        toolId: clearToolId ? null : (toolId ?? this.toolId),
         toolL: toolL ?? this.toolL,
         toolR: toolR ?? this.toolR,
         toolM: toolM ?? this.toolM,
@@ -98,8 +95,6 @@ class SamuraiAttackConfig {
 }
 
 // ═══════════════════════════════════════════════════
-//  معسكر الساموراي
-// ═══════════════════════════════════════════════════
 class SamuraiCamp {
   final int x, y, kid;
   final int type;
@@ -107,6 +102,7 @@ class SamuraiCamp {
   final int level;
   final int level2;
   final int campId;
+  final int ownerId;
   final double distanceFromSource;
   final int sourceAreaId;
   final String sourceName;
@@ -118,7 +114,7 @@ class SamuraiCamp {
     required this.x, required this.y, required this.kid,
     required this.type, required this.hp,
     required this.level, required this.level2,
-    this.campId = 0,
+    this.campId = 0, this.ownerId = -1,
     required this.distanceFromSource,
     required this.sourceAreaId, required this.sourceName,
     this.lastAttackAt, this.lastAttackMid,
@@ -133,13 +129,8 @@ class SamuraiCamp {
 
   String get coordsLabel => '($x,$y)';
   String get key => '$x,$y,$kid';
-
   bool get isDead => type != 29 && hp <= 0;
-
-  bool get hasActiveAttack {
-    if (lastAttackAt == null) return false;
-    return DateTime.now().difference(lastAttackAt!).inMinutes < 30;
-  }
+  bool get isPlayerCamp => ownerId != -1;
 
   SamuraiCamp copyWith({
     int? hp, int? level, int? level2,
@@ -149,7 +140,7 @@ class SamuraiCamp {
         hp: hp ?? this.hp,
         level: level ?? this.level,
         level2: level2 ?? this.level2,
-        campId: campId,
+        campId: campId, ownerId: ownerId,
         distanceFromSource: distanceFromSource,
         sourceAreaId: sourceAreaId, sourceName: sourceName,
         lastAttackAt: lastAttackAt ?? this.lastAttackAt,
@@ -157,8 +148,6 @@ class SamuraiCamp {
       );
 }
 
-// ═══════════════════════════════════════════════════
-//  نتيجة الهجوم
 // ═══════════════════════════════════════════════════
 class SamuraiAttackResult {
   final bool success;
@@ -169,41 +158,52 @@ class SamuraiAttackResult {
   final int wavesSent;
   final int toolsUsed;
   final bool usedTools;
+  final int lordIdUsed;
 
   SamuraiAttackResult._({
     required this.success, this.error, this.movementId,
     this.target, this.totalUnits = 0, this.wavesSent = 0,
-    this.toolsUsed = 0, this.usedTools = false,
+    this.toolsUsed = 0, this.usedTools = false, this.lordIdUsed = 0,
   });
 
   factory SamuraiAttackResult.ok({
     required int mid, required SamuraiCamp t,
     required int units, required int waves,
-    required int tools, required bool usedTools,
+    required int tools, required bool usedTools, int lordIdUsed = 0,
   }) => SamuraiAttackResult._(
         success: true, movementId: mid, target: t,
         totalUnits: units, wavesSent: waves,
-        toolsUsed: tools, usedTools: usedTools,
+        toolsUsed: tools, usedTools: usedTools, lordIdUsed: lordIdUsed,
       );
 
   factory SamuraiAttackResult.fail(String err) =>
       SamuraiAttackResult._(success: false, error: err);
+
+  SamuraiAttackResult copyWithLordId(int lid) => SamuraiAttackResult._(
+        success: success, error: error, movementId: movementId,
+        target: target, totalUnits: totalUnits, wavesSent: wavesSent,
+        toolsUsed: toolsUsed, usedTools: usedTools, lordIdUsed: lid,
+      );
 }
 
-// ═══════════════════════════════════════════════════
-//  إعدادات المسح
 // ═══════════════════════════════════════════════════
 class SamuraiSettings {
   int radiusTiles;
   int sourceAreaId;
+  int maxLevel;
+  bool skipPlayerCamps;
 
   SamuraiSettings({
     this.radiusTiles = kSamuraiDefaultRadius,
     this.sourceAreaId = 0,
+    this.maxLevel = 100,
+    this.skipPlayerCamps = true,
   });
 
   static const _kRadius = 'samurai_radius_v1';
   static const _kSource = 'samurai_source_v1';
+  static const _kMaxLevel = 'samurai_max_level_v1';
+  static const _kSkipPlayer = 'samurai_skip_player_v1';
 
   static Future<SamuraiSettings> load() async {
     final p = await SharedPreferences.getInstance();
@@ -212,6 +212,8 @@ class SamuraiSettings {
     return SamuraiSettings(
       radiusTiles: r,
       sourceAreaId: p.getInt(_kSource) ?? 0,
+      maxLevel: p.getInt(_kMaxLevel) ?? 100,
+      skipPlayerCamps: p.getBool(_kSkipPlayer) ?? true,
     );
   }
 
@@ -219,11 +221,11 @@ class SamuraiSettings {
     final p = await SharedPreferences.getInstance();
     await p.setInt(_kRadius, radiusTiles);
     await p.setInt(_kSource, sourceAreaId);
+    await p.setInt(_kMaxLevel, maxLevel);
+    await p.setBool(_kSkipPlayer, skipPlayerCamps);
   }
 }
 
-// ═══════════════════════════════════════════════════
-//  الخدمة الرئيسية
 // ═══════════════════════════════════════════════════
 class SamuraiService {
   final GgeClient conn;
@@ -235,6 +237,7 @@ class SamuraiService {
 
   final Map<String, DateTime> _cooldowns = {};
   static const _kCooldowns = 'samurai_cooldowns_v1';
+  final Map<String, DateTime> _activeCamps = {};
 
   Future<void> loadCooldowns() async {
     final p = await SharedPreferences.getInstance();
@@ -278,9 +281,20 @@ class SamuraiService {
     return r.isNegative ? Duration.zero : r;
   }
 
+  bool isCampUnderAttack(SamuraiCamp c) {
+    final dt = _activeCamps[c.key];
+    if (dt == null) return false;
+    if (DateTime.now().difference(dt).inMinutes >= 30) {
+      _activeCamps.remove(c.key);
+      return false;
+    }
+    return true;
+  }
+
   Future<void> markCampAttacked(SamuraiCamp c,
       {int minutes = kSamuraiDefaultCooldownMin}) async {
     _cooldowns[c.key] = DateTime.now().add(Duration(minutes: minutes));
+    _activeCamps[c.key] = DateTime.now();
     await _saveCooldowns();
   }
 
@@ -296,12 +310,11 @@ class SamuraiService {
     } catch (_) {}
   }
 
-  // ═══════════════════════════════════════════════
-  //  المسح
-  // ═══════════════════════════════════════════════
   Future<List<SamuraiCamp>> scanArea({
     required OwnedCastle source,
     required int radiusTiles,
+    int maxLevel = 100,
+    bool skipPlayerCamps = true,
     void Function(int done, int total)? onProgress,
   }) async {
     if (_lastScanAt != null &&
@@ -363,8 +376,8 @@ class SamuraiService {
               final y = _asInt(entry[2]);
               final key = '$x,$y';
               if (seen.contains(key)) continue;
-              seen.add(key);
 
+              final ownerId = _asInt(entry[3], -1);
               int hp = 0, level = 0, level2 = 0, campId = 0;
 
               if (type == 29) {
@@ -379,13 +392,25 @@ class SamuraiService {
                 if (level <= 0 && level2 > 0) level = level2;
               }
 
+              if (skipPlayerCamps && ownerId != -1) {
+                TrafficLog.add('ST',
+                    '[Samurai] ⏭️ Skip player camp at ($x,$y) ownerId=$ownerId');
+                continue;
+              }
+              if (maxLevel > 0 && level > maxLevel) {
+                TrafficLog.add('ST',
+                    '[Samurai] ⏭️ Skip high-level camp ($x,$y) Lv$level > max$maxLevel');
+                continue;
+              }
+
+              seen.add(key);
               final dx = (x - cx).toDouble();
               final dy = (y - cy).toDouble();
               found.add(SamuraiCamp(
                 x: x, y: y, kid: source.kingdomId,
                 type: type, hp: hp,
                 level: level, level2: level2,
-                campId: campId,
+                campId: campId, ownerId: ownerId,
                 distanceFromSource: sqrt(dx * dx + dy * dy),
                 sourceAreaId: source.areaId,
                 sourceName: source.displayName,
@@ -404,9 +429,6 @@ class SamuraiService {
     return found;
   }
 
-  // ═══════════════════════════════════════════════
-  //  🔥 الهجوم — مع 3 محاولات fallback
-  // ═══════════════════════════════════════════════
   Future<SamuraiAttackResult> attack({
     required SamuraiCamp camp,
     required OwnedCastle source,
@@ -414,63 +436,85 @@ class SamuraiService {
     required List<CastleUnit> availableUnits,
     SamuraiAttackConfig config = const SamuraiAttackConfig(),
     int? manualLevel,
+    List<Lord>? fallbackLords,
     bool markCooldownAfterSuccess = true,
   }) async {
-    // ─── المحاولة 1: الإعدادات الكاملة (مع حدود آمنة) ───
-    TrafficLog.add('ST',
-        '[Samurai] ⚔️ Attempt 1: ${config.waves} waves · ${config.useTools ? "with tools" : "no tools"}');
-    
-    var result = await _tryAttack(
-      camp: camp, source: source, lordId: lordId,
-      availableUnits: availableUnits, config: config,
-      manualLevel: manualLevel,
-      unitScale: 1.0,
-    );
-
-    if (result.success) {
-      if (markCooldownAfterSuccess) await markCampAttacked(camp);
-      return result;
+    if (isCampUnderAttack(camp)) {
+      return SamuraiAttackResult.fail(
+          'CAMP_UNDER_ATTACK: فيه هجوم شغال على (${camp.coordsLabel})');
     }
 
-    // ─── المحاولة 2: لو 313 → جرّب wave واحدة و 70% وحدات ───
-    if (result.error == 'CRA 313' || result.error == 'TOO_MANY_UNITS_313') {
-      TrafficLog.add('ST',
-          '[Samurai] ⚠️ 313 — Retry: 1 wave · 70% units · same tools');
-      result = await _tryAttack(
-        camp: camp, source: source, lordId: lordId,
-        availableUnits: availableUnits,
-        config: config.copyWith(waves: 1),
-        manualLevel: manualLevel,
-        unitScale: 0.7,
-      );
-      if (result.success) {
-        if (markCooldownAfterSuccess) await markCampAttacked(camp);
-        return result;
+    final lordsToTry = <int>[lordId];
+    if (fallbackLords != null) {
+      for (final l in fallbackLords) {
+        if (l.id != lordId && l.id > 0 && !lordsToTry.contains(l.id)) {
+          lordsToTry.add(l.id);
+        }
       }
     }
 
-    // ─── المحاولة 3: لو لسه فاشل → جرّب بدون أدوات ───
-    if (config.useTools && (result.error?.contains('313') == true ||
-        result.error == 'CRA 100' ||
-        result.error == 'UNIT_NOT_SENDABLE_91')) {
+    SamuraiAttackResult? lastResult;
+
+    for (final lid in lordsToTry) {
       TrafficLog.add('ST',
-          '[Samurai] ⚠️ Retry: 1 wave · 70% units · WITHOUT tools');
-      result = await _tryAttack(
-        camp: camp, source: source, lordId: lordId,
-        availableUnits: availableUnits,
-        config: config.withoutTools().copyWith(waves: 1),
-        manualLevel: manualLevel,
-        unitScale: 0.7,
+          '[Samurai] ⚔️ Try Lord $lid on ${camp.coordsLabel}');
+
+      var result = await _tryAttack(
+        camp: camp, source: source, lordId: lid,
+        availableUnits: availableUnits, config: config,
+        manualLevel: manualLevel, unitScale: 1.0,
       );
+
       if (result.success) {
         if (markCooldownAfterSuccess) await markCampAttacked(camp);
-        return result;
+        return result.copyWithLordId(lid);
       }
+
+      if (result.error == 'CRA 313' || result.error == 'TOO_MANY_UNITS_313') {
+        TrafficLog.add('ST',
+            '[Samurai] ⚠️ 313 → retry 1 wave · 70% units · same tools');
+        result = await _tryAttack(
+          camp: camp, source: source, lordId: lid,
+          availableUnits: availableUnits,
+          config: config.copyWith(waves: 1),
+          manualLevel: manualLevel, unitScale: 0.7,
+        );
+        if (result.success) {
+          if (markCooldownAfterSuccess) await markCampAttacked(camp);
+          return result.copyWithLordId(lid);
+        }
+      }
+
+      if (config.useTools && (result.error?.contains('313') == true ||
+          result.error == 'CRA 100' ||
+          result.error == 'UNIT_NOT_SENDABLE_91')) {
+        TrafficLog.add('ST',
+            '[Samurai] ⚠️ retry 1 wave · 70% units · WITHOUT tools');
+        result = await _tryAttack(
+          camp: camp, source: source, lordId: lid,
+          availableUnits: availableUnits,
+          config: config.withoutTools().copyWith(waves: 1),
+          manualLevel: manualLevel, unitScale: 0.7,
+        );
+        if (result.success) {
+          if (markCooldownAfterSuccess) await markCampAttacked(camp);
+          return result.copyWithLordId(lid);
+        }
+      }
+
+      lastResult = result;
+
+      final err = result.error ?? '';
+      final isLordIssue = err.contains('256') ||
+          err.contains('218') ||
+          err.contains('CRA 6') ||
+          err.contains('404');
+      if (!isLordIssue) break;
+      TrafficLog.add('ST',
+          '[Samurai] 🔄 Lord $lid failed ($err) → try next lord');
     }
 
-    TrafficLog.add('ER',
-        '[Samurai] ❌ All attempts failed: ${result.error}');
-    return result;
+    return lastResult ?? SamuraiAttackResult.fail('ALL_ATTEMPTS_FAILED');
   }
 
   Future<SamuraiAttackResult> _tryAttack({
@@ -482,14 +526,12 @@ class SamuraiService {
     int? manualLevel,
     double unitScale = 1.0,
   }) async {
-    // 1) تحديد الـ level
     final lvl = manualLevel ?? (camp.level > 0 ? camp.level : camp.level2);
     if (lvl <= 0) {
       return SamuraiAttackResult.fail(
           'LEVEL_UNKNOWN: محتاج تحدد level المعسكر يدويًا');
     }
 
-    // 2) ✅ حدود آمنة — نأخذ الأقل بين max attack و safe cap
     final rawFlank = SamuraiMath.flankMax(lvl);
     final rawMiddle = SamuraiMath.middleMax(lvl);
     final maxFlankUnits = min(rawFlank, kSafeMaxFlankUnits);
@@ -497,35 +539,32 @@ class SamuraiService {
     final maxFlankTools = SamuraiMath.toolCapFlank(lvl);
     final maxMiddleTools = SamuraiMath.toolCapMiddle(lvl);
 
-    // 3) فلترة الوحدات
     final combat = availableUnits
-        .where((u) => u.isCombat && u.amount > 0)
+        .where((u) => u.amount > 0 && _isOffensiveUnit(u))
         .toList();
-    if (combat.isEmpty) return SamuraiAttackResult.fail('NO_UNITS');
+    if (combat.isEmpty) {
+      return SamuraiAttackResult.fail(
+          'NO_OFFENSIVE_UNITS: مفيش وحدات هجومية في القلعة');
+    }
 
-    // 4) فصل melee / ranged
     final melee = combat.where((u) {
       if (u.info?.role == 'melee') return true;
       if (u.info?.role == 'ranged') return false;
-      return u.wodId >= 601 && u.wodId <= 620;
-    }).toList()
-      ..sort((a, b) => b.amount.compareTo(a.amount));
+      return u.wodId >= 10 && u.wodId <= 20;
+    }).toList()..sort((a, b) => b.amount.compareTo(a.amount));
 
     final ranged = combat.where((u) {
       if (u.info?.role == 'ranged') return true;
       if (u.info?.role == 'melee') return false;
-      return !(u.wodId >= 601 && u.wodId <= 620);
-    }).toList()
-      ..sort((a, b) => b.amount.compareTo(a.amount));
+      return !(u.wodId >= 10 && u.wodId <= 20);
+    }).toList()..sort((a, b) => b.amount.compareTo(a.amount));
 
-    // 5) عدد الـ waves
     int waveCount = config.waves.clamp(1, 3);
     final totalUnits = combat.fold<int>(0, (s, u) => s + u.amount);
     final perWaveMax = maxFlankUnits * 2 + maxMiddleUnits;
     final maxByUnits = (totalUnits / perWaveMax).ceil().clamp(1, 3);
     if (waveCount > maxByUnits) waveCount = maxByUnits;
 
-    // 6) بناء الـ waves
     final remaining = <int, int>{};
     for (final u in combat) remaining[u.wodId] = u.amount;
 
@@ -538,7 +577,6 @@ class SamuraiService {
       final flankPool = (isFirstWave || melee.isEmpty) ? ranged : melee;
       final middlePool = ranged.isNotEmpty ? ranged : melee;
 
-      // ✅ نطبق unitScale
       final scaledFlank = (maxFlankUnits * unitScale).round();
       final scaledMiddle = (maxMiddleUnits * unitScale).round();
 
@@ -551,7 +589,6 @@ class SamuraiService {
 
       totalSent += waveSum;
 
-      // ✅ Tools — كلها في slot 0 (منع تكرار نفس الأداة)
       List<List<int>> lT2, rT2, mT2;
       if (config.useTools) {
         lT2 = _fillTools(config.toolId!, config.toolL, 2, maxFlankTools);
@@ -573,7 +610,6 @@ class SamuraiService {
 
     if (wavesPayload.isEmpty) return SamuraiAttackResult.fail('NO_WAVES');
 
-    // 7) تحقق من حد 10 أنواع
     final usedIds = <int>{};
     for (final w in wavesPayload) {
       for (final wing in ['L', 'R', 'M']) {
@@ -587,7 +623,6 @@ class SamuraiService {
           'TOO_MANY_UNIT_TYPES (${usedIds.length} > 10)');
     }
 
-    // 8) بناء الـ payload
     final payload = {
       'SX': source.x, 'SY': source.y,
       'TX': camp.x, 'TY': camp.y,
@@ -603,33 +638,26 @@ class SamuraiService {
 
     await _ensureKingdom(camp.kid);
 
-    // 9) إرسال
     final result = await _sendAttack(payload, camp);
 
     if (result.success) {
       return SamuraiAttackResult.ok(
-        mid: result.movementId ?? -1,
-        t: camp,
-        units: totalSent,
-        waves: wavesPayload.length,
-        tools: toolsUsed,
-        usedTools: config.useTools,
+        mid: result.movementId ?? -1, t: camp,
+        units: totalSent, waves: wavesPayload.length,
+        tools: toolsUsed, usedTools: config.useTools,
+        lordIdUsed: lordId,
       );
     }
     return result;
   }
 
   Future<SamuraiAttackResult> _sendAttack(
-    Map<String, dynamic> payload,
-    SamuraiCamp camp,
+    Map<String, dynamic> payload, SamuraiCamp camp,
   ) async {
     try {
       final resp = await conn.sendXtAndWait(
-        'cra',
-        jsonEncode(payload),
-        responseCmd: 'cra',
-        timeoutMs: 25000,
-        isAction: true,
+        'cra', jsonEncode(payload),
+        responseCmd: 'cra', timeoutMs: 25000, isAction: true,
       );
 
       if (resp.resultCode == 0) {
@@ -647,10 +675,12 @@ class SamuraiService {
       }
 
       final code = resp.resultCode;
+      if (code == 6) return SamuraiAttackResult.fail('CRA 6');
       if (code == 91) return SamuraiAttackResult.fail('UNIT_NOT_SENDABLE_91');
+      if (code == 100) return SamuraiAttackResult.fail('CRA 100');
       if (code == 218) return SamuraiAttackResult.fail('LORD_BUSY_218');
       if (code == 181) return SamuraiAttackResult.fail('MAX_MOVEMENTS_181');
-      if (code == 100) return SamuraiAttackResult.fail('CRA_100');
+      if (code == 256) return SamuraiAttackResult.fail('CRA 256');
       if (code == 313) return SamuraiAttackResult.fail('TOO_MANY_UNITS_313');
       return SamuraiAttackResult.fail('CRA $code');
     } catch (e) {
@@ -658,14 +688,16 @@ class SamuraiService {
     }
   }
 
-  // ═══════════════════════════════════════════════
-  //  Helpers
-  // ═══════════════════════════════════════════════
+  bool _isOffensiveUnit(CastleUnit u) {
+    if (u.info?.fightType != null) {
+      return u.info!.fightType == 0;
+    }
+    if (kDefensiveUnitWodIds.contains(u.wodId)) return false;
+    return u.info?.role == 'melee' || u.info?.role == 'ranged';
+  }
+
   List<List<int>> _fillFromPool(
-    Map<int, int> remaining,
-    List<CastleUnit> pool,
-    int maxTotal,
-    int slots,
+    Map<int, int> remaining, List<CastleUnit> pool, int maxTotal, int slots,
   ) {
     final out = <List<int>>[];
     int allocated = 0;
@@ -683,8 +715,6 @@ class SamuraiService {
     return out;
   }
 
-  /// ✅ كل الأدوات في slot 0 — عشان نمنع تكرار نفس الأداة في slot تاني
-  /// (ده اللي كان بيسبب error 313)
   List<List<int>> _fillTools(int toolId, int total, int slots, int cap) {
     if (toolId <= 0 || total <= 0) {
       return List.generate(slots, (_) => [-1, 0]);
@@ -699,7 +729,6 @@ class SamuraiService {
 
   int _sum(List<List<int>> u) =>
       u.fold<int>(0, (s, e) => s + (e[0] > 0 ? e[1] : 0));
-
   int _sumTools(List<List<int>> u) =>
       u.fold<int>(0, (s, e) => s + (e[0] > 0 ? e[1] : 0));
 

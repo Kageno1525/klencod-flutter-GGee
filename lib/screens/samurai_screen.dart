@@ -31,7 +31,6 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
   int _scanDone = 0, _scanTotal = 0;
   bool _loading = true;
 
-  // ⚙️ إعدادات الهجوم الافتراضية (تُحفظ في SharedPreferences)
   SamuraiAttackConfig _defaultConfig = const SamuraiAttackConfig();
   static const _kDefaultWaves = 'samurai_default_waves';
   static const _kDefaultToolId = 'samurai_default_tool_id';
@@ -114,6 +113,8 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
       final found = await _svc.scanArea(
         source: _source!,
         radiusTiles: _settings.radiusTiles,
+        maxLevel: _settings.maxLevel,
+        skipPlayerCamps: _settings.skipPlayerCamps,
         onProgress: (d, t) {
           if (!mounted) return;
           setState(() {
@@ -221,6 +222,10 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
                         decoration: TextDecoration.none)),
               ],
             ),
+          ),
+          IconButton(
+            icon: const Icon(Icons.tune_rounded, color: kSamuraiGold),
+            onPressed: _openFilterDialog,
           ),
         ],
       ),
@@ -335,6 +340,26 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
               ]),
             ),
           ),
+          const SizedBox(width: 8),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            decoration: BoxDecoration(
+              color: Colors.white.withOpacity(0.08),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: Colors.white24),
+            ),
+            child: Row(mainAxisSize: MainAxisSize.min, children: [
+              const Icon(Icons.trending_up_rounded,
+                  color: Colors.white70, size: 14),
+              const SizedBox(width: 4),
+              Text('Lv ≤ ${_settings.maxLevel}',
+                  style: const TextStyle(
+                      color: Colors.white70,
+                      fontSize: 11,
+                      fontWeight: FontWeight.bold,
+                      decoration: TextDecoration.none)),
+            ]),
+          ),
         ],
       ),
     );
@@ -393,13 +418,13 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
 
   Widget _campCard(SamuraiCamp c) {
     final inCooldown = _svc.isCampInCooldown(c);
+    final underAttack = _svc.isCampUnderAttack(c);
     final cd = _svc.campCooldownRemaining(c);
     final dead = c.isDead;
-    final levelOk = c.level > 0 || c.level2 > 0;
 
     final borderColor = dead
         ? Colors.grey
-        : (inCooldown ? Colors.orange : kSamuraiRed);
+        : (inCooldown || underAttack ? Colors.orange : kSamuraiRed);
 
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
@@ -423,7 +448,7 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
                   decoration: BoxDecoration(
                     color: (dead
                             ? Colors.grey
-                            : inCooldown
+                            : (inCooldown || underAttack)
                                 ? Colors.orange
                                 : kSamuraiRed)
                         .withOpacity(0.15),
@@ -432,12 +457,12 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
                   child: Icon(
                       dead
                           ? Icons.dangerous_rounded
-                          : inCooldown
+                          : (inCooldown || underAttack)
                               ? Icons.hourglass_top_rounded
                               : Icons.shield_rounded,
                       color: dead
                           ? Colors.grey
-                          : inCooldown
+                          : (inCooldown || underAttack)
                               ? Colors.orange
                               : kSamuraiRed,
                       size: 22),
@@ -457,19 +482,20 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
                         const SizedBox(width: 8),
                         if (dead)
                           _pill('مدمر', Colors.grey)
+                        else if (underAttack)
+                          _pill('هجوم شغال', Colors.orange)
                         else if (inCooldown)
                           _pill(
                               '${cd.inMinutes}:${(cd.inSeconds % 60).toString().padLeft(2, "0")}',
                               Colors.orange)
                         else if (c.type != 29)
                           _pill('HP ${c.hp}', kSamuraiRed)
-                        else if (!levelOk)
+                        else if (c.level <= 0)
                           _pill('Lv ؟', Colors.amber),
                       ]),
                       const SizedBox(height: 4),
                       Row(children: [
-                        Text(
-                            '${c.typeName} · Lv ${c.level > 0 ? c.level : c.level2}',
+                        Text('${c.typeName} · Lv ${c.level > 0 ? c.level : c.level2}',
                             style: TextStyle(
                                 color: AppTheme.subTextColor(context),
                                 fontSize: 10.5,
@@ -514,7 +540,7 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
       );
 
   Future<void> _openCampSheet(SamuraiCamp c) async {
-    final result = await showModalBottomSheet<bool>(
+    final result = await showModalBottomSheet<SamuraiAttackResult>(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
@@ -530,7 +556,7 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
         },
       ),
     );
-    if (result == true && mounted) {
+    if (result != null && result.success && mounted) {
       setState(() {
         final i = _camps.indexWhere((x) => x.key == c.key);
         if (i >= 0) {
@@ -539,6 +565,11 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
           );
         }
       });
+      _snack(
+        '✅ ${result.wavesSent} waves · ${result.totalUnits} وحدة'
+        '${result.usedTools ? " · ${result.toolsUsed} أداة" : " · بدون أدوات"}',
+        color: AppTheme.green,
+      );
     }
   }
 
@@ -590,10 +621,83 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
       ),
     );
   }
+
+  void _openFilterDialog() {
+    int maxLevel = _settings.maxLevel;
+    bool skipPlayer = _settings.skipPlayerCamps;
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSt) => AlertDialog(
+          backgroundColor: Theme.of(ctx).colorScheme.surface,
+          title: const Text('فلاتر المسح',
+              style: TextStyle(decoration: TextDecoration.none)),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(children: [
+                const Text('Max Level:',
+                    style: TextStyle(
+                        color: Colors.white70,
+                        fontSize: 13,
+                        decoration: TextDecoration.none)),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Slider(
+                    value: maxLevel.toDouble(),
+                    min: 1, max: 100,
+                    divisions: 99,
+                    activeColor: kSamuraiGold,
+                    label: '$maxLevel',
+                    onChanged: (v) => setSt(() => maxLevel = v.round()),
+                  ),
+                ),
+                Text('$maxLevel',
+                    style: const TextStyle(
+                        color: kSamuraiGold,
+                        fontWeight: FontWeight.bold,
+                        decoration: TextDecoration.none)),
+              ]),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('تجاهل قلاع اللاعبين',
+                    style: TextStyle(
+                        fontSize: 13,
+                        decoration: TextDecoration.none)),
+                subtitle: const Text(
+                    'قلاع ملونة (Diamond Castle, إلخ)',
+                    style: TextStyle(
+                        fontSize: 10,
+                        color: Colors.white54,
+                        decoration: TextDecoration.none)),
+                value: skipPlayer,
+                activeColor: kSamuraiGold,
+                onChanged: (v) => setSt(() => skipPlayer = v),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('إلغاء')),
+            ElevatedButton(
+              onPressed: () {
+                setState(() {
+                  _settings.maxLevel = maxLevel;
+                  _settings.skipPlayerCamps = skipPlayer;
+                  _settings.save();
+                });
+                Navigator.pop(ctx);
+              },
+              child: const Text('موافق'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 }
 
-// ═══════════════════════════════════════════════════════
-//  Attack sheet
 // ═══════════════════════════════════════════════════════
 class _SamuraiAttackSheet extends StatefulWidget {
   final GgeClient client;
@@ -626,6 +730,7 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
 
   bool _loading = true;
   bool _sending = false;
+  String? _lastError;
 
   @override
   void initState() {
@@ -677,56 +782,49 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
 
   Future<void> _attack() async {
     if (_selectedLord == null) {
-      _snack('اختر قائد', color: AppTheme.red);
+      setState(() => _lastError = 'اختر قائد');
       return;
     }
     if (_units.isEmpty) {
-      _snack('مفيش وحدات قتالية في القلعة', color: AppTheme.orange);
+      setState(() => _lastError = 'مفيش وحدات قتالية في القلعة');
       return;
     }
     if (_effectiveLevel <= 0) {
-      _snack('محتاج تحدد Level المعسكر يدويًا', color: AppTheme.orange);
+      setState(() => _lastError = 'محتاج تحدد Level المعسكر يدويًا');
       return;
     }
 
     widget.onConfigChanged(_config);
 
-    setState(() => _sending = true);
+    setState(() {
+      _sending = true;
+      _lastError = null;
+    });
+
+    // ✅ استخراج كل اللوردات المتاحة كـ fallback
+    final fallbackLords = _commanders
+        .where((c) => !c.isBusy)
+        .map((c) => c.lord)
+        .toList();
+
     final res = await widget.svc.attack(
       camp: widget.camp,
       source: widget.source,
       lordId: _selectedLord!.id,
+      fallbackLords: fallbackLords,
       availableUnits: _units,
       config: _config,
       manualLevel: _manualLevel,
     );
+
     if (!mounted) return;
     setState(() => _sending = false);
 
     if (res.success) {
-      if (mounted) {
-        _snack(
-          '✅ ${res.wavesSent} waves · ${res.totalUnits} وحدة'
-          '${res.usedTools ? " · ${res.toolsUsed} أداة" : " · بدون أدوات"}',
-          color: AppTheme.green,
-        );
-      }
-      Navigator.pop(context, true);
+      Navigator.pop(context, res);
     } else {
-      _snack(res.error ?? 'فشل الهجوم', color: AppTheme.red);
+      setState(() => _lastError = res.error ?? 'فشل الهجوم');
     }
-  }
-
-  void _snack(String msg, {Color? color}) {
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(
-        content: Text(msg,
-            style: const TextStyle(decoration: TextDecoration.none),
-            maxLines: 5),
-        backgroundColor: color,
-        behavior: SnackBarBehavior.floating,
-      ));
   }
 
   @override
@@ -799,6 +897,7 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
                       controller: scrollCtrl,
                       padding: const EdgeInsets.fromLTRB(16, 8, 16, 20),
                       children: [
+                        if (_lastError != null) _errorBanner(),
                         _levelCard(),
                         const SizedBox(height: 12),
                         _lordSection(),
@@ -846,7 +945,36 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
     );
   }
 
-  // ─── كارت الـ level ─────────────────────────────
+  Widget _errorBanner() {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: AppTheme.red.withOpacity(0.15),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: AppTheme.red.withOpacity(0.5)),
+      ),
+      child: Row(children: [
+        const Icon(Icons.error_outline, color: AppTheme.red, size: 20),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(_lastError!,
+              style: const TextStyle(
+                  color: AppTheme.red,
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                  decoration: TextDecoration.none)),
+        ),
+        IconButton(
+          icon: const Icon(Icons.close, color: AppTheme.red, size: 16),
+          onPressed: () => setState(() => _lastError = null),
+          padding: EdgeInsets.zero,
+          constraints: const BoxConstraints(),
+        ),
+      ]),
+    );
+  }
+
   Widget _levelCard() {
     final autoLevel = widget.camp.level > 0 ? widget.camp.level : 0;
     final needManual = autoLevel <= 0;
@@ -922,7 +1050,6 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
     );
   }
 
-  // ─── كارت الإعدادات ─────────────────────────────
   Widget _configCard() {
     return Container(
       padding: const EdgeInsets.all(12),
@@ -945,8 +1072,6 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
                     decoration: TextDecoration.none)),
           ]),
           const SizedBox(height: 8),
-
-          // عدد الـ waves
           Row(children: [
             const Text('Waves:',
                 style: TextStyle(
@@ -970,15 +1095,15 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
                     fontWeight: FontWeight.bold,
                     decoration: TextDecoration.none)),
           ]),
-
-          // تفعيل الأدوات
           SwitchListTile(
             contentPadding: EdgeInsets.zero,
             title: const Text('استخدام أدوات الساموراي (166)',
                 style: TextStyle(
                     fontSize: 12, decoration: TextDecoration.none)),
             subtitle: Text(
-                'كل wave: ${_config.toolsPerWave} أداة',
+                _config.useTools
+                    ? 'كل wave: ${_config.toolsPerWave} أداة'
+                    : 'الأدوات متوقفة',
                 style: const TextStyle(
                     fontSize: 10,
                     color: Colors.white54,
@@ -986,11 +1111,11 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
             value: _config.useTools,
             activeColor: kSamuraiGold,
             onChanged: (v) => setState(() {
-              _config = _config.copyWith(
-                  toolId: v ? 166 : null);
+              _config = v
+                  ? _config.copyWith(toolId: 166)
+                  : _config.copyWith(clearToolId: true);
             }),
           ),
-
           if (_config.useTools) ...[
             const SizedBox(height: 4),
             Row(children: [
@@ -1052,12 +1177,9 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
     );
   }
 
-  // ─── Preview ────────────────────────────────────
   Widget _previewCard() {
     final lvl = _effectiveLevel;
-    if (lvl <= 0) {
-      return const SizedBox.shrink();
-    }
+    if (lvl <= 0) return const SizedBox.shrink();
     final maxFlank = SamuraiMath.flankMax(lvl);
     final maxMiddle = SamuraiMath.middleMax(lvl);
     final maxWave = maxFlank * 2 + maxMiddle;
@@ -1101,7 +1223,6 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
     );
   }
 
-  // ─── Lord ───────────────────────────────────────
   Widget _lordSection() {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
