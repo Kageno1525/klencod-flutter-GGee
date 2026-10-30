@@ -70,6 +70,7 @@ class SamuraiMath {
 class SamuraiAttackConfig {
   final int waves;
   final int? toolId;
+  final int? fallbackToolId;   // ✅ جديد — الأداة البديلة (30 افتراضيًا)
   final int toolL;
   final int toolR;
   final int toolM;
@@ -78,6 +79,7 @@ class SamuraiAttackConfig {
   const SamuraiAttackConfig({
     this.waves = 3,
     this.toolId = 166,
+    this.fallbackToolId = 30,
     this.toolL = 20,
     this.toolR = 20,
     this.toolM = 30,
@@ -90,11 +92,16 @@ class SamuraiAttackConfig {
   int get toolsPerWave => useTools ? (toolL + toolR + toolM) : 0;
 
   SamuraiAttackConfig copyWith({
-    int? waves, int? toolId, int? toolL, int? toolR, int? toolM,
+    int? waves, int? toolId, int? fallbackToolId,
+    int? toolL, int? toolR, int? toolM,
     bool? attackDaimyoCastles, bool clearToolId = false,
+    bool clearFallbackToolId = false,
   }) => SamuraiAttackConfig(
         waves: waves ?? this.waves,
         toolId: clearToolId ? null : (toolId ?? this.toolId),
+        fallbackToolId: clearFallbackToolId
+            ? null
+            : (fallbackToolId ?? this.fallbackToolId),
         toolL: toolL ?? this.toolL,
         toolR: toolR ?? this.toolR,
         toolM: toolM ?? this.toolM,
@@ -102,7 +109,9 @@ class SamuraiAttackConfig {
       );
 
   SamuraiAttackConfig withoutTools() => SamuraiAttackConfig(
-        waves: waves, toolId: null,
+        waves: waves,
+        toolId: null,
+        fallbackToolId: null,
         toolL: toolL, toolR: toolR, toolM: toolM,
         attackDaimyoCastles: attackDaimyoCastles,
       );
@@ -136,7 +145,7 @@ class SamuraiCamp {
 
   bool get isDaimyoCastle => kDaimyoCastleTypes.contains(type);
 
-  // ✅ جديد: هل المعسكر مملوك للاعب؟
+  // ✅ هل المعسكر مملوك للاعب؟
   bool get isPlayerCamp => ownerId != -1;
 
   String get typeName {
@@ -497,6 +506,7 @@ class SamuraiService {
     required OwnedCastle source,
     required int lordId,
     required List<CastleUnit> availableUnits,
+    List<CastleUnit>? allUnitsForTools,
     SamuraiAttackConfig config = const SamuraiAttackConfig(),
     int? manualLevel,
     List<Lord>? fallbackLords,
@@ -544,7 +554,9 @@ class SamuraiService {
 
       var result = await _tryAttack(
         camp: camp, source: source, lordId: lid,
-        availableUnits: availableUnits, config: config,
+        availableUnits: availableUnits,
+        allUnitsForTools: allUnitsForTools,
+        config: config,
         manualLevel: manualLevel, unitScale: 1.0,
       );
 
@@ -574,6 +586,7 @@ class SamuraiService {
         result = await _tryAttack(
           camp: camp, source: source, lordId: lid,
           availableUnits: availableUnits,
+          allUnitsForTools: allUnitsForTools,
           config: config.copyWith(waves: 1),
           manualLevel: manualLevel, unitScale: 0.7,
         );
@@ -593,6 +606,7 @@ class SamuraiService {
         result = await _tryAttack(
           camp: camp, source: source, lordId: lid,
           availableUnits: availableUnits,
+          allUnitsForTools: allUnitsForTools,
           config: config.withoutTools().copyWith(waves: 1),
           manualLevel: manualLevel, unitScale: 0.7,
         );
@@ -621,6 +635,7 @@ class SamuraiService {
     required OwnedCastle source,
     required int lordId,
     required List<CastleUnit> availableUnits,
+    List<CastleUnit>? allUnitsForTools,
     required SamuraiAttackConfig config,
     int? manualLevel,
     double unitScale = 1.0,
@@ -665,6 +680,11 @@ class SamuraiService {
     final remaining = <int, int>{};
     for (final u in combat) remaining[u.wodId] = u.amount;
 
+    // ✅ اختيار الأداة الفعلية (أساسية → بديلة → بدون)
+    final toolCheckSource = allUnitsForTools ?? availableUnits;
+    final toolChoice = _pickTool(toolCheckSource, config);
+    final effectiveToolId = toolChoice.id;
+
     final wavesPayload = <Map<String, dynamic>>[];
     int totalSent = 0;
     int toolsUsed = 0;
@@ -687,10 +707,10 @@ class SamuraiService {
       totalSent += waveSum;
 
       List<List<int>> lT2, rT2, mT2;
-      if (config.useTools) {
-        lT2 = _fillTools(config.toolId!, config.toolL, 2, maxFlankTools);
-        rT2 = _fillTools(config.toolId!, config.toolR, 2, maxFlankTools);
-        mT2 = _fillTools(config.toolId!, config.toolM, 3, maxMiddleTools);
+      if (effectiveToolId != null) {
+        lT2 = _fillTools(effectiveToolId, config.toolL, 2, maxFlankTools);
+        rT2 = _fillTools(effectiveToolId, config.toolR, 2, maxFlankTools);
+        mT2 = _fillTools(effectiveToolId, config.toolM, 3, maxMiddleTools);
         toolsUsed += _sumTools(lT2) + _sumTools(rT2) + _sumTools(mT2);
       } else {
         lT2 = List.generate(2, (_) => [-1, 0]);
@@ -740,11 +760,58 @@ class SamuraiService {
       return SamuraiAttackResult.ok(
         mid: result.movementId ?? -1, t: camp,
         units: totalSent, waves: wavesPayload.length,
-        tools: toolsUsed, usedTools: config.useTools,
+        tools: toolsUsed,
+        usedTools: effectiveToolId != null,
         lordIdUsed: lordId,
       );
     }
     return result;
+  }
+
+  /// ✅ اختيار الأداة الفعلية: أساسية → بديلة → بدون أدوات
+  ({int? id, bool isFallback}) _pickTool(
+      List<CastleUnit> units, SamuraiAttackConfig config) {
+    if (!config.useTools) {
+      return (id: null, isFallback: false);
+    }
+    final needed = config.toolL + config.toolR + config.toolM;
+    if (needed <= 0) {
+      return (id: null, isFallback: false);
+    }
+
+    // 1) الأداة الأساسية
+    final primaryId = config.toolId!;
+    final primaryHave = _toolAmountIn(units, primaryId);
+    if (primaryHave >= needed) {
+      return (id: primaryId, isFallback: false);
+    }
+    TrafficLog.add('ST',
+        '[Samurai] ⚠️ Tool $primaryId short — need $needed, have $primaryHave');
+
+    // 2) الأداة البديلة
+    final fallbackId = config.fallbackToolId;
+    if (fallbackId != null && fallbackId > 0 && fallbackId != primaryId) {
+      final fallbackHave = _toolAmountIn(units, fallbackId);
+      if (fallbackHave >= needed) {
+        TrafficLog.add('ST',
+            '[Samurai] 🔁 Using fallback tool $fallbackId (have $fallbackHave)');
+        return (id: fallbackId, isFallback: true);
+      }
+      TrafficLog.add('ST',
+          '[Samurai] ⚠️ Fallback $fallbackId also short — have $fallbackHave');
+    }
+
+    // 3) مفيش أدوات خالص → نهجم بدون أدوات
+    TrafficLog.add('ST',
+        '[Samurai] 🚫 No tools available → attacking without tools');
+    return (id: null, isFallback: false);
+  }
+
+  int _toolAmountIn(List<CastleUnit> units, int wodId) {
+    for (final u in units) {
+      if (u.wodId == wodId) return u.amount;
+    }
+    return 0;
   }
 
   Future<SamuraiAttackResult> _sendAttack(

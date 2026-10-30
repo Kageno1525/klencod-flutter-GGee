@@ -26,6 +26,7 @@ class SamuraiAutoService {
   static const _kMinUnits = 'samurai_auto_min_units';
   static const _kCommanderIds = 'samurai_auto_commander_ids';
   static const _kToolId = 'samurai_auto_tool_id';
+  static const _kFallbackToolId = 'samurai_auto_fallback_tool_id';
   static const _kToolL = 'samurai_auto_tool_l';
   static const _kToolR = 'samurai_auto_tool_r';
   static const _kToolM = 'samurai_auto_tool_m';
@@ -43,6 +44,7 @@ class SamuraiAutoService {
 
   static const int kDefMinUnits = 30;
   static const int kDefToolId = 166;
+  static const int kDefFallbackToolId = 30;  // ✅ الأداة البديلة
   static const int kDefToolL = 20;
   static const int kDefToolR = 20;
   static const int kDefToolM = 30;
@@ -127,6 +129,15 @@ class SamuraiAutoService {
 
   Future<int> getToolId() async =>
       (await SharedPreferences.getInstance()).getInt(_kToolId) ?? kDefToolId;
+
+  Future<int> getFallbackToolId() async =>
+      (await SharedPreferences.getInstance()).getInt(_kFallbackToolId) ??
+      kDefFallbackToolId;
+
+  Future<void> setFallbackToolId(int v) async {
+    final p = await SharedPreferences.getInstance();
+    await p.setInt(_kFallbackToolId, v);
+  }
 
   Future<int> getToolL() async =>
       (await SharedPreferences.getInstance()).getInt(_kToolL) ?? kDefToolL;
@@ -488,6 +499,7 @@ class SamuraiAutoService {
         final config = SamuraiAttackConfig(
           waves: await getWaves(),
           toolId: await getToolId(),
+          fallbackToolId: await getFallbackToolId(),  // ✅
           toolL: await getToolL(),
           toolR: await getToolR(),
           toolM: await getToolM(),
@@ -503,6 +515,7 @@ class SamuraiAutoService {
             lordId: lordInfo.lord.id,
             fallbackLords: null,
             availableUnits: sendable,
+            allUnitsForTools: freshUnits,  // ✅ كل وحدات القلعة للتحقق من الأدوات
             config: config,
           );
 
@@ -516,7 +529,7 @@ class SamuraiAutoService {
             await _incrementAttacksToday();
 
             TrafficLog.add('ST',
-                '[Samurai-Auto] ✅ HIT ${camp.coordsLabel} units=${result.totalUnits}');
+                '[Samurai-Auto] ✅ HIT ${camp.coordsLabel} units=${result.totalUnits} tools=${result.usedTools}');
             _setStatus('✅ Hit ${camp.coordsLabel}! (#$attacksThisTick)');
 
             final delaySec = delayMin +
