@@ -1,9 +1,12 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:gge/gge_client.dart';
 import 'package:gge/models.dart';
 import 'package:gge/services/samurai_service.dart';
+import 'package:gge/services/samurai_auto_service.dart';
+import 'package:gge/services/background_service.dart';
 import 'package:gge/theme.dart';
 import 'package:gge/widgets/animated_widgets.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -20,9 +23,11 @@ class SamuraiScreen extends StatefulWidget {
   State<SamuraiScreen> createState() => _SamuraiScreenState();
 }
 
-class _SamuraiScreenState extends State<SamuraiScreen> {
+class _SamuraiScreenState extends State<SamuraiScreen>
+    with TickerProviderStateMixin {
   late final SamuraiService _svc;
   late SamuraiSettings _settings;
+  late TabController _tabCtrl;
 
   List<OwnedCastle> _castles = [];
   OwnedCastle? _source;
@@ -31,24 +36,45 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
   int _scanDone = 0, _scanTotal = 0;
   bool _loading = true;
 
-  SamuraiAttackConfig _defaultConfig = const SamuraiAttackConfig();
-  static const _kDefaultWaves = 'samurai_default_waves';
-  static const _kDefaultToolId = 'samurai_default_tool_id';
-  static const _kDefaultToolL = 'samurai_default_tool_l';
-  static const _kDefaultToolR = 'samurai_default_tool_r';
-  static const _kDefaultToolM = 'samurai_default_tool_m';
+  // Auto data
+  List<CommanderInfo> _allCommanders = [];
+  Set<int> _selectedCommanderIds = {};
+  bool _loadingAutoData = false;
+
+  // Auto settings
+  bool _autoEnabled = false;
+  int _minUnits = 30;
+  int _delayMin = 10;
+  int _delayMax = 15;
+  int _maxLevel = 60;
+  bool _skipDaimyo = true;
+  int _maxAttacksDay = 0;
+  int _waves = 3;
+  int _toolId = 166;
+  int _toolL = 20;
+  int _toolR = 20;
+  int _toolM = 30;
+
+  // Background status
+  String _bgStatus = '—';
+  String _bgExtra = '';
+  Timer? _bgStatusTimer;
 
   @override
   void initState() {
     super.initState();
     _svc = SamuraiService(widget.client);
     _svc.loadCooldowns();
+    _tabCtrl = TabController(length: 2, vsync: this);
+    _tabCtrl.addListener(() => setState(() {}));
     _init();
+    _startBgStatusPolling();
   }
 
   Future<void> _init() async {
     _settings = await SamuraiSettings.load();
-    await _loadDefaultConfig();
+    await _loadAutoSettings();
+
     try {
       final castles = await widget.client.getCastles();
       if (!mounted) return;
@@ -56,8 +82,8 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
         _castles = castles;
         if (castles.isNotEmpty) {
           try {
-            _source = castles
-                .firstWhere((c) => c.areaId == _settings.sourceAreaId);
+            _source = castles.firstWhere(
+                (c) => c.areaId == _settings.sourceAreaId);
           } catch (_) {
             try {
               _source = castles.firstWhere((c) => c.areaType == 1);
@@ -74,29 +100,69 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
     }
   }
 
-  Future<void> _loadDefaultConfig() async {
-    final p = await SharedPreferences.getInstance();
-    final waves = p.getInt(_kDefaultWaves) ?? 3;
-    final toolId = p.getInt(_kDefaultToolId) ?? 166;
-    final toolL = p.getInt(_kDefaultToolL) ?? 20;
-    final toolR = p.getInt(_kDefaultToolR) ?? 20;
-    final toolM = p.getInt(_kDefaultToolM) ?? 30;
-    _defaultConfig = SamuraiAttackConfig(
-      waves: waves,
-      toolId: toolId > 0 ? toolId : null,
-      toolL: toolL, toolR: toolR, toolM: toolM,
-    );
+  Future<void> _loadAutoSettings() async {
+    final s = SamuraiAutoService.instance;
+    final enabled = await s.isEnabled();
+    final minUnits = await s.getMinUnits();
+    final delayMin = await s.getDelayMin();
+    final delayMax = await s.getDelayMax();
+    final maxLevel = await s.getMaxLevel();
+    final skipDaimyo = await s.getSkipDaimyo();
+    final maxAttacksDay = await s.getMaxAttacksDay();
+    final waves = await s.getWaves();
+    final toolId = await s.getToolId();
+    final toolL = await s.getToolL();
+    final toolR = await s.getToolR();
+    final toolM = await s.getToolM();
+    final commanders = await s.getCommanderIds();
+
+    if (!mounted) return;
+    setState(() {
+      _autoEnabled = enabled;
+      _minUnits = minUnits;
+      _delayMin = delayMin;
+      _delayMax = delayMax;
+      _maxLevel = maxLevel;
+      _skipDaimyo = skipDaimyo;
+      _maxAttacksDay = maxAttacksDay;
+      _waves = waves;
+      _toolId = toolId;
+      _toolL = toolL;
+      _toolR = toolR;
+      _toolM = toolM;
+      _selectedCommanderIds = commanders.toSet();
+    });
   }
 
-  Future<void> _saveDefaultConfig(SamuraiAttackConfig c) async {
-    final p = await SharedPreferences.getInstance();
-    await p.setInt(_kDefaultWaves, c.waves);
-    await p.setInt(_kDefaultToolId, c.toolId ?? 0);
-    await p.setInt(_kDefaultToolL, c.toolL);
-    await p.setInt(_kDefaultToolR, c.toolR);
-    await p.setInt(_kDefaultToolM, c.toolM);
+  void _startBgStatusPolling() {
+    _bgStatusTimer?.cancel();
+    _bgStatusTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
+      if (!mounted) return;
+      try {
+        final status = await BackgroundService.readSamuraiStatus();
+        if (!mounted) return;
+        final newStatus = status['status']?.toString() ?? '—';
+        final newExtra = status['extra']?.toString() ?? '';
+        if (newStatus != _bgStatus || newExtra != _bgExtra) {
+          setState(() {
+            _bgStatus = newStatus;
+            _bgExtra = newExtra;
+          });
+        }
+      } catch (_) {}
+    });
   }
 
+  @override
+  void dispose() {
+    _bgStatusTimer?.cancel();
+    _tabCtrl.dispose();
+    super.dispose();
+  }
+
+  // ═══════════════════════════════════════════════════════
+  //  Manual scan
+  // ═══════════════════════════════════════════════════════
   Future<void> _scan() async {
     if (_source == null) {
       _snack('اختر قلعة مصدر أولاً', color: AppTheme.red);
@@ -153,6 +219,59 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
       ));
   }
 
+  // ═══════════════════════════════════════════════════════
+  //  Auto: load commanders
+  // ═══════════════════════════════════════════════════════
+  Future<void> _loadAutoData() async {
+    if (_loadingAutoData) return;
+    setState(() => _loadingAutoData = true);
+    try {
+      final cmds = await widget.client.getCommanders();
+      if (!mounted) return;
+      setState(() {
+        _allCommanders = cmds;
+        _loadingAutoData = false;
+      });
+    } catch (e) {
+      if (mounted) {
+        setState(() => _loadingAutoData = false);
+        _snack('Load error: $e', color: AppTheme.red);
+      }
+    }
+  }
+
+  Future<void> _openCommandersPicker() async {
+    if (_allCommanders.isEmpty) await _loadAutoData();
+    if (!mounted) return;
+
+    final result = await showModalBottomSheet<Set<int>>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => _MultiSelectSheet(
+        title: 'اختر القواد',
+        items: _allCommanders
+            .map((c) => _SelectItem(
+                  id: c.lord.id,
+                  label: c.lord.id == 0
+                      ? 'اللورد الرئيسي'
+                      : c.lord.displayName,
+                  subtitle: c.isBusy ? 'مشغول' : 'متاح',
+                ))
+            .toList(),
+        selected: _selectedCommanderIds,
+        allowEmpty: true,
+        emptyMeansAll: false,
+      ),
+    );
+    if (result == null) return;
+    await SamuraiAutoService.instance.setCommanderIds(result.toList());
+    if (mounted) setState(() => _selectedCommanderIds = result);
+  }
+
+  // ═══════════════════════════════════════════════════════
+  //  Build
+  // ═══════════════════════════════════════════════════════
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -163,18 +282,22 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
             child: Column(
               children: [
                 _header(),
+                _tabBar(),
                 if (_loading)
                   const Expanded(
                     child: Center(
-                      child: CircularProgressIndicator(color: kSamuraiRed),
+                      child:
+                          CircularProgressIndicator(color: kSamuraiRed),
                     ),
                   )
                 else
-                  Expanded(child: _content()),
+                  Expanded(
+                    child: _tabCtrl.index == 0 ? _manualTab() : _autoTab(),
+                  ),
               ],
             ),
           ),
-          if (_source != null && !_loading)
+          if (_tabCtrl.index == 0 && _source != null)
             Positioned(
               left: 16,
               right: 16,
@@ -224,30 +347,89 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
               ],
             ),
           ),
-          IconButton(
-            icon: const Icon(Icons.tune_rounded, color: kSamuraiGold),
-            onPressed: _openFilterDialog,
-          ),
+          if (_tabCtrl.index == 0)
+            IconButton(
+              icon: const Icon(Icons.tune_rounded, color: kSamuraiGold),
+              onPressed: _openFilterDialog,
+            ),
         ],
       ),
     );
   }
 
-  Widget _content() {
+  Widget _tabBar() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
+      child: Container(
+        padding: const EdgeInsets.all(4),
+        decoration: BoxDecoration(
+          color: Colors.white.withOpacity(0.06),
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Row(children: [
+          _tabBtn('يدوي', 0, Icons.touch_app_rounded),
+          _tabBtn('تلقائي', 1, Icons.auto_awesome_rounded),
+        ]),
+      ),
+    );
+  }
+
+  Widget _tabBtn(String label, int index, IconData icon) {
+    final sel = _tabCtrl.index == index;
+    return Expanded(
+      child: GestureDetector(
+        onTap: () => _tabCtrl.animateTo(index),
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 10),
+          decoration: BoxDecoration(
+            gradient: sel
+                ? const LinearGradient(colors: [kSamuraiRed, kSamuraiDark])
+                : null,
+            color: sel ? null : Colors.transparent,
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(icon,
+                  size: 16,
+                  color: sel ? Colors.white : AppTheme.subTextColor(context)),
+              const SizedBox(width: 6),
+              Text(label,
+                  style: TextStyle(
+                      color: sel ? Colors.white : AppTheme.subTextColor(context),
+                      fontWeight: FontWeight.bold,
+                      fontSize: 12,
+                      decoration: TextDecoration.none)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ═══════════════════════════════════════════════════════
+  //  Manual Tab
+  // ═══════════════════════════════════════════════════════
+  Widget _manualTab() {
+    final filtered = _camps.toList()
+      ..sort((a, b) =>
+          a.distanceFromSource.compareTo(b.distanceFromSource));
+
     return Column(
       children: [
         _sourcePicker(),
         _filterBar(),
         if (_scanning) _progressBar(),
         Expanded(
-          child: _camps.isEmpty
+          child: filtered.isEmpty
               ? _emptyView()
               : ListView.builder(
                   padding: const EdgeInsets.fromLTRB(16, 4, 16, 100),
-                  itemCount: _camps.length,
+                  itemCount: filtered.length,
                   itemBuilder: (_, i) => FadeSlideIn(
                     delay: Duration(milliseconds: 30 + i * 30),
-                    child: _campCard(_camps[i]),
+                    child: _campCard(filtered[i]),
                   ),
                 ),
         ),
@@ -255,6 +437,573 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
     );
   }
 
+  // ═══════════════════════════════════════════════════════
+  //  Auto Tab
+  // ═══════════════════════════════════════════════════════
+  Widget _autoTab() {
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+      children: [
+        _sourcePicker(),
+        const SizedBox(height: 10),
+        _bigStatusCard(),
+        const SizedBox(height: 10),
+        _bgServiceCard(),
+        const SizedBox(height: 10),
+        _autoControlsCard(),
+        const SizedBox(height: 10),
+        _autoSettingsCard(),
+        const SizedBox(height: 10),
+        _autoFilterCard(),
+      ],
+    );
+  }
+
+  Widget _bigStatusCard() {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: _autoEnabled
+              ? [const Color(0xFF16A34A), const Color(0xFF15803D)]
+              : [const Color(0xFF37474F), const Color(0xFF546E7A)],
+        ),
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: [
+          BoxShadow(
+            color:
+                (_autoEnabled ? Colors.green : Colors.grey).withOpacity(0.3),
+            blurRadius: 20,
+            offset: const Offset(0, 8),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: Colors.white.withOpacity(0.2),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Icon(
+                  _autoEnabled
+                      ? Icons.bolt_rounded
+                      : Icons.pause_rounded,
+                  color: Colors.white,
+                  size: 24),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('Auto Attack',
+                      style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                          decoration: TextDecoration.none)),
+                  Text(
+                      _autoEnabled
+                          ? 'الخلفية شغالة · بيهجم تلقائي'
+                          : 'متوقف',
+                      style: const TextStyle(
+                          color: Colors.white70,
+                          fontSize: 11,
+                          decoration: TextDecoration.none)),
+                ],
+              ),
+            ),
+            Container(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: Colors.white.withOpacity(0.2),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(_autoEnabled ? 'ON' : 'OFF',
+                  style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 11,
+                      fontWeight: FontWeight.bold,
+                      decoration: TextDecoration.none)),
+            ),
+          ]),
+          const SizedBox(height: 14),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: Colors.black.withOpacity(0.3),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('آخر status',
+                    style: TextStyle(
+                        color: Colors.white70,
+                        fontSize: 10,
+                        fontWeight: FontWeight.bold,
+                        decoration: TextDecoration.none)),
+                const SizedBox(height: 4),
+                Text(_bgStatus,
+                    style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 15,
+                        fontWeight: FontWeight.bold,
+                        decoration: TextDecoration.none)),
+                if (_bgExtra.isNotEmpty) ...[
+                  const SizedBox(height: 4),
+                  Text(_bgExtra,
+                      style: const TextStyle(
+                          color: Colors.white70,
+                          fontSize: 11,
+                          decoration: TextDecoration.none)),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _bgServiceCard() {
+    final running = BackgroundService.isRunning;
+    return AppTheme.glassCard(
+      context: context,
+      padding: const EdgeInsets.all(14),
+      child: Row(children: [
+        Container(
+          padding: const EdgeInsets.all(8),
+          decoration: BoxDecoration(
+            color: kSamuraiGold.withOpacity(0.15),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: const Icon(Icons.nightlight_round,
+              color: kSamuraiGold, size: 18),
+        ),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('الخلفية',
+                  style: TextStyle(
+                      color: AppTheme.textColor(context),
+                      fontWeight: FontWeight.bold,
+                      fontSize: 14,
+                      decoration: TextDecoration.none)),
+              Text(running ? 'يعمل في الخلفية' : 'متوقف',
+                  style: TextStyle(
+                      color:
+                          running ? Colors.green : AppTheme.subTextColor(context),
+                      fontSize: 11,
+                      decoration: TextDecoration.none)),
+            ],
+          ),
+        ),
+        Switch(
+          value: running,
+          activeColor: kSamuraiGold,
+          onChanged: (v) async {
+            if (v) {
+              final ok = await BackgroundService.start();
+              if (mounted) {
+                _snack(ok ? '✅ الخلفية شغالة' : '❌ فشل التشغيل',
+                    color: ok ? AppTheme.green : AppTheme.red);
+                setState(() {});
+              }
+            } else {
+              await BackgroundService.stop();
+              if (mounted) setState(() {});
+            }
+          },
+        ),
+      ]),
+    );
+  }
+
+  Widget _autoControlsCard() {
+    return AppTheme.glassCard(
+      context: context,
+      padding: const EdgeInsets.all(14),
+      child: Column(children: [
+        SizedBox(
+          width: double.infinity,
+          height: 52,
+          child: ElevatedButton.icon(
+            onPressed: () async {
+              if (_source == null) {
+                _snack('اختر قلعة مصدر أولاً', color: AppTheme.red);
+                return;
+              }
+              if (_selectedCommanderIds.isEmpty) {
+                _snack('اختر قواد أولاً', color: AppTheme.orange);
+                return;
+              }
+
+              final newValue = !_autoEnabled;
+              await SamuraiAutoService.instance.setEnabled(newValue);
+
+              if (newValue) {
+                await SamuraiAutoService.instance.setSource(
+                  areaId: _source!.areaId,
+                  kid: _source!.kingdomId,
+                  x: _source!.x,
+                  y: _source!.y,
+                );
+              }
+
+              if (!BackgroundService.isRunning) {
+                await BackgroundService.start();
+              }
+
+              if (mounted) {
+                setState(() => _autoEnabled = newValue);
+                _snack(
+                  newValue
+                      ? '✅ Auto شغال — الخلفية بتهجم تلقائي'
+                      : '⏸️ Auto متوقف',
+                  color: newValue ? AppTheme.green : AppTheme.orange,
+                );
+              }
+            },
+            icon: Icon(_autoEnabled
+                ? Icons.stop_rounded
+                : Icons.play_arrow_rounded),
+            label: Text(_autoEnabled ? 'إيقاف Auto' : 'تشغيل Auto',
+                style: const TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 14,
+                    decoration: TextDecoration.none)),
+            style: ElevatedButton.styleFrom(
+              backgroundColor:
+                  _autoEnabled ? AppTheme.red : const Color(0xFF16A34A),
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12)),
+            ),
+          ),
+        ),
+        if (_autoEnabled && _selectedCommanderIds.isEmpty) ...[
+          const SizedBox(height: 8),
+          Container(
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: Colors.orange.withOpacity(0.15),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: Colors.orange.withOpacity(0.5)),
+            ),
+            child: const Row(children: [
+              Icon(Icons.warning_amber, color: Colors.orange, size: 16),
+              SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                    '⚠️ محتاج تختار قواد من الفلاتر تحت عشان يشتغل',
+                    style: TextStyle(
+                        color: Colors.orange,
+                        fontSize: 11,
+                        decoration: TextDecoration.none)),
+              ),
+            ]),
+          ),
+        ],
+      ]),
+    );
+  }
+
+  Widget _autoSettingsCard() {
+    return AppTheme.glassCard(
+      context: context,
+      padding: const EdgeInsets.all(14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            const Icon(Icons.settings_rounded, color: kSamuraiGold, size: 18),
+            const SizedBox(width: 8),
+            Text('إعدادات الهجوم التلقائي',
+                style: TextStyle(
+                    color: AppTheme.textColor(context),
+                    fontWeight: FontWeight.bold,
+                    fontSize: 14,
+                    decoration: TextDecoration.none)),
+          ]),
+          const SizedBox(height: 12),
+
+          // Delays
+          Text('التأخير بين الهجمات',
+              style: TextStyle(
+                  fontSize: 12,
+                  color: AppTheme.subTextColor(context),
+                  decoration: TextDecoration.none)),
+          const SizedBox(height: 6),
+          Row(children: [
+            Expanded(
+              child: _numberField('أقل (ث)',
+                  '${_delayMin}', _delayMin, (v) async {
+                if (v < 5) v = 5;
+                setState(() => _delayMin = v);
+                await SamuraiAutoService.instance.setDelay(min: v);
+              }),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: _numberField('أكثر (ث)',
+                  '${_delayMax}', _delayMax, (v) async {
+                if (v < _delayMin) v = _delayMin;
+                setState(() => _delayMax = v);
+                await SamuraiAutoService.instance.setDelay(max: v);
+              }),
+            ),
+          ]),
+
+          const SizedBox(height: 12),
+          Divider(color: AppTheme.subTextColor(context).withOpacity(0.15)),
+          const SizedBox(height: 8),
+
+          // Min units + max level + daily limit
+          Row(children: [
+            Expanded(
+              child: _numberField('أقل وحدات', '$_minUnits', _minUnits, (v) async {
+                setState(() => _minUnits = v);
+                await SamuraiAutoService.instance.setMinUnits(v);
+              }),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: _numberField('Max Lv', '$_maxLevel', _maxLevel, (v) async {
+                setState(() => _maxLevel = v);
+                await SamuraiAutoService.instance.setMaxLevel(v);
+              }),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: _numberField('يومي', '0 = ∞', _maxAttacksDay,
+                  (v) async {
+                setState(() => _maxAttacksDay = v);
+                await SamuraiAutoService.instance.setMaxAttacksDay(v);
+              }),
+            ),
+          ]),
+
+          const SizedBox(height: 12),
+          Divider(color: AppTheme.subTextColor(context).withOpacity(0.15)),
+          const SizedBox(height: 8),
+
+          // Waves + tools
+          Row(children: [
+            const Text('Waves:',
+                style: TextStyle(
+                    color: Colors.white70,
+                    fontSize: 12,
+                    decoration: TextDecoration.none)),
+            Expanded(
+              child: Slider(
+                value: _waves.toDouble(),
+                min: 1, max: 3, divisions: 2,
+                activeColor: kSamuraiRed,
+                label: '$_waves',
+                onChanged: (v) async {
+                  final w = v.round();
+                  setState(() => _waves = w);
+                  await SamuraiAutoService.instance.setWaves(w);
+                },
+              ),
+            ),
+            Text('$_waves',
+                style: const TextStyle(
+                    color: kSamuraiRed,
+                    fontWeight: FontWeight.bold,
+                    decoration: TextDecoration.none)),
+          ]),
+
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: Text('الأدوات (WID $_toolId)',
+                style: TextStyle(
+                    fontSize: 13,
+                    color: AppTheme.textColor(context),
+                    decoration: TextDecoration.none)),
+            subtitle: Text(
+                (_toolL + _toolR + _toolM) > 0
+                    ? '$_toolL L · $_toolM M · $_toolR R'
+                    : 'بدون أدوات',
+                style: TextStyle(
+                    fontSize: 10,
+                    color: AppTheme.subTextColor(context),
+                    decoration: TextDecoration.none)),
+            value: (_toolL + _toolR + _toolM) > 0,
+            activeColor: kSamuraiGold,
+            onChanged: (v) async {
+              if (v) {
+                setState(() {
+                  _toolL = 20;
+                  _toolR = 20;
+                  _toolM = 30;
+                });
+                await SamuraiAutoService.instance
+                    .setToolAmounts(l: 20, r: 20, m: 30);
+              } else {
+                setState(() {
+                  _toolL = 0;
+                  _toolR = 0;
+                  _toolM = 0;
+                });
+                await SamuraiAutoService.instance
+                    .setToolAmounts(l: 0, r: 0, m: 0);
+              }
+            },
+          ),
+
+          if ((_toolL + _toolR + _toolM) > 0)
+            Row(children: [
+              Expanded(
+                child: _numberField('L', '$_toolL', _toolL, (v) async {
+                  setState(() => _toolL = v);
+                  await SamuraiAutoService.instance.setToolAmounts(l: v);
+                }),
+              ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: _numberField('M', '$_toolM', _toolM, (v) async {
+                  setState(() => _toolM = v);
+                  await SamuraiAutoService.instance.setToolAmounts(m: v);
+                }),
+              ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: _numberField('R', '$_toolR', _toolR, (v) async {
+                  setState(() => _toolR = v);
+                  await SamuraiAutoService.instance.setToolAmounts(r: v);
+                }),
+              ),
+            ]),
+
+          const SizedBox(height: 8),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: Text('تجاهل قلاع الدايميو (37/38)',
+                style: TextStyle(
+                    fontSize: 13,
+                    color: AppTheme.textColor(context),
+                    decoration: TextDecoration.none)),
+            subtitle: const Text(
+                'موصى به — قلاع لاعبين مش NPC',
+                style: TextStyle(
+                    fontSize: 10,
+                    color: Colors.green,
+                    decoration: TextDecoration.none)),
+            value: _skipDaimyo,
+            activeColor: Colors.green,
+            onChanged: (v) async {
+              setState(() => _skipDaimyo = v);
+              await SamuraiAutoService.instance.setSkipDaimyo(v);
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _autoFilterCard() {
+    return AppTheme.glassCard(
+      context: context,
+      padding: const EdgeInsets.all(14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            const Icon(Icons.tune_rounded, color: AppTheme.orange, size: 18),
+            const SizedBox(width: 8),
+            Text('فلتر القواد',
+                style: TextStyle(
+                    color: AppTheme.textColor(context),
+                    fontWeight: FontWeight.bold,
+                    fontSize: 14,
+                    decoration: TextDecoration.none)),
+          ]),
+          const SizedBox(height: 10),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.people_alt_rounded,
+                color: kSamuraiGold, size: 22),
+            title: const Text('القواد المسموحين',
+                style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    decoration: TextDecoration.none)),
+            subtitle: Text(
+                _selectedCommanderIds.isEmpty
+                    ? '⚠️ مفيش محدد — لازم تختار'
+                    : '${_selectedCommanderIds.length} قائد مختار',
+                style: TextStyle(
+                    fontSize: 11,
+                    color: _selectedCommanderIds.isEmpty
+                        ? Colors.orange
+                        : AppTheme.subTextColor(context),
+                    decoration: TextDecoration.none)),
+            trailing: const Icon(Icons.edit_rounded,
+                color: kSamuraiGold, size: 18),
+            onTap: _openCommandersPicker,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _numberField(
+    String label,
+    String hint,
+    int value,
+    ValueChanged<int> onChanged,
+  ) {
+    return TextField(
+      controller: TextEditingController(text: value.toString())
+        ..selection =
+            TextSelection.collapsed(offset: value.toString().length),
+      keyboardType: TextInputType.number,
+      inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+      style: TextStyle(
+          color: AppTheme.textColor(context),
+          fontSize: 13,
+          fontWeight: FontWeight.bold),
+      decoration: InputDecoration(
+        labelText: label,
+        hintText: hint,
+        labelStyle: TextStyle(
+            color: AppTheme.subTextColor(context), fontSize: 10),
+        hintStyle: TextStyle(
+            color: AppTheme.subTextColor(context).withOpacity(0.5),
+            fontSize: 10),
+        isDense: true,
+        contentPadding:
+            const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+        enabledBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(8),
+            borderSide:
+                BorderSide(color: kSamuraiGold.withOpacity(0.3))),
+        focusedBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(8),
+            borderSide: const BorderSide(color: kSamuraiGold)),
+      ),
+      onChanged: (s) {
+        final v = int.tryParse(s) ?? 0;
+        onChanged(v.clamp(0, 9999));
+      },
+    );
+  }
+
+  // ═══════════════════════════════════════════════════════
+  //  Shared widgets
+  // ═══════════════════════════════════════════════════════
   Widget _sourcePicker() {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
@@ -295,13 +1044,19 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
                                     fontSize: 12)),
                           ))
                       .toList(),
-                  onChanged: (v) {
+                  onChanged: (v) async {
                     if (v == null) return;
                     setState(() {
                       _source = v;
                       _settings.sourceAreaId = v.areaId;
                       _settings.save();
                     });
+                    await SamuraiAutoService.instance.setSource(
+                      areaId: v.areaId,
+                      kid: v.kingdomId,
+                      x: v.x,
+                      y: v.y,
+                    );
                   },
                 ),
               ),
@@ -315,11 +1070,8 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
   Widget _filterBar() {
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
-      child: Wrap(
-        spacing: 8,
-        runSpacing: 6,
+      child: Row(
         children: [
-          // Radius chip
           GestureDetector(
             onTap: _openRadiusDialog,
             child: Container(
@@ -344,7 +1096,7 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
               ]),
             ),
           ),
-          // Max level chip
+          const SizedBox(width: 8),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
             decoration: BoxDecoration(
@@ -364,44 +1116,6 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
                       decoration: TextDecoration.none)),
             ]),
           ),
-          // ✅ Daimyo status badge
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            decoration: BoxDecoration(
-              color: (_settings.includeDaimyoInScan
-                      ? Colors.orange
-                      : Colors.green)
-                  .withOpacity(0.15),
-              borderRadius: BorderRadius.circular(10),
-              border: Border.all(
-                  color: (_settings.includeDaimyoInScan
-                          ? Colors.orange
-                          : Colors.green)
-                      .withOpacity(0.4)),
-            ),
-            child: Row(mainAxisSize: MainAxisSize.min, children: [
-              Icon(
-                  _settings.includeDaimyoInScan
-                      ? Icons.warning_amber_rounded
-                      : Icons.shield_rounded,
-                  color: _settings.includeDaimyoInScan
-                      ? Colors.orange
-                      : Colors.green,
-                  size: 14),
-              const SizedBox(width: 4),
-              Text(
-                  _settings.includeDaimyoInScan
-                      ? 'مع Daimyo'
-                      : 'بدون Daimyo',
-                  style: TextStyle(
-                      color: _settings.includeDaimyoInScan
-                          ? Colors.orange
-                          : Colors.green,
-                      fontSize: 11,
-                      fontWeight: FontWeight.bold,
-                      decoration: TextDecoration.none)),
-            ]),
-          ),
         ],
       ),
     );
@@ -413,7 +1127,9 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
       child: ClipRRect(
         borderRadius: BorderRadius.circular(6),
         child: LinearProgressIndicator(
-          value: _scanning && _scanTotal > 0 ? _scanDone / _scanTotal : null,
+          value: _scanning && _scanTotal > 0
+              ? _scanDone / _scanTotal
+              : null,
           minHeight: 4,
           backgroundColor: kSamuraiRed.withOpacity(0.1),
           valueColor: const AlwaysStoppedAnimation(kSamuraiRed),
@@ -463,20 +1179,22 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
     final underAttack = _svc.isCampUnderAttack(c);
     final cd = _svc.campCooldownRemaining(c);
     final dead = c.isDead;
-    final isDaimyo = c.isDaimyoCastle;
+    final daimyo = c.isDaimyoCastle;
 
-    // ✅ الـ Daimyo castles بيبانوا بلون برتقالي
-    final primaryColor = isDaimyo ? Colors.orange : kSamuraiRed;
     final borderColor = dead
         ? Colors.grey
-        : (inCooldown || underAttack ? Colors.orange : primaryColor);
+        : daimyo
+            ? Colors.orange
+            : (inCooldown || underAttack ? Colors.orange : kSamuraiRed);
 
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
       child: GestureDetector(
-        onTap: (inCooldown || dead) ? null : () => _openCampSheet(c),
+        onTap: (inCooldown || dead || daimyo)
+            ? null
+            : () => _openCampSheet(c),
         child: Opacity(
-          opacity: (inCooldown || dead) ? 0.55 : 1.0,
+          opacity: (inCooldown || dead || daimyo) ? 0.55 : 1.0,
           child: Container(
             decoration: BoxDecoration(
               color: AppTheme.isDark(context)
@@ -493,25 +1211,29 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
                   decoration: BoxDecoration(
                     color: (dead
                             ? Colors.grey
-                            : (inCooldown || underAttack)
+                            : daimyo
                                 ? Colors.orange
-                                : primaryColor)
+                                : (inCooldown || underAttack)
+                                    ? Colors.orange
+                                    : kSamuraiRed)
                         .withOpacity(0.15),
                     borderRadius: BorderRadius.circular(12),
                   ),
                   child: Icon(
-                      isDaimyo
-                          ? Icons.account_balance_rounded
-                          : (dead
-                              ? Icons.dangerous_rounded
+                      dead
+                          ? Icons.dangerous_rounded
+                          : daimyo
+                              ? Icons.lock_rounded
                               : (inCooldown || underAttack)
                                   ? Icons.hourglass_top_rounded
-                                  : Icons.shield_rounded),
+                                  : Icons.shield_rounded,
                       color: dead
                           ? Colors.grey
-                          : (inCooldown || underAttack)
+                          : daimyo
                               ? Colors.orange
-                              : primaryColor,
+                              : (inCooldown || underAttack)
+                                  ? Colors.orange
+                                  : kSamuraiRed,
                       size: 22),
                 ),
                 const SizedBox(width: 12),
@@ -527,17 +1249,17 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
                                 fontSize: 15,
                                 decoration: TextDecoration.none)),
                         const SizedBox(width: 8),
-                        if (isDaimyo)
-                          _pill('Daimyo', Colors.orange)
-                        else if (dead)
+                        if (dead)
                           _pill('مدمر', Colors.grey)
+                        else if (daimyo)
+                          _pill('Daimyo', Colors.orange)
                         else if (underAttack)
                           _pill('هجوم شغال', Colors.orange)
                         else if (inCooldown)
                           _pill(
                               '${cd.inMinutes}:${(cd.inSeconds % 60).toString().padLeft(2, "0")}',
                               Colors.orange)
-                        else if (c.type != kSamuraiCampType)
+                        else if (c.type != 29)
                           _pill('HP ${c.hp}', kSamuraiRed)
                         else if (c.level <= 0)
                           _pill('Lv ؟', Colors.amber),
@@ -599,38 +1321,28 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
         source: _source!,
         camp: c,
         svc: _svc,
-        defaultConfig: _defaultConfig,
-        onConfigChanged: (cfg) {
-          _defaultConfig = cfg;
-          _saveDefaultConfig(cfg);
-        },
       ),
     );
-
-    if (!mounted) return;
-
-    if (result != null && result.success) {
+    if (result != null && result.success && mounted) {
       setState(() {
         final i = _camps.indexWhere((x) => x.key == c.key);
         if (i >= 0) {
-          _camps[i] = _camps[i].copyWith(lastAttackAt: DateTime.now());
+          _camps[i] = _camps[i].copyWith(
+            lastAttackAt: DateTime.now(),
+          );
         }
       });
       _snack(
         '✅ ${result.wavesSent} waves · ${result.totalUnits} وحدة'
-        '${result.usedTools ? " · ${result.toolsUsed} أداة" : " · بدون أدوات"}'
-        '${result.attemptsMade > 1 ? " (${result.attemptsMade} محاولات)" : ""}',
+        '${result.usedTools ? " · ${result.toolsUsed} أداة" : " · بدون أدوات"}',
         color: AppTheme.green,
-      );
-    } else if (result != null && !result.success) {
-      _snack(
-        '❌ ${result.error ?? "فشل"}'
-        '${result.attemptsMade > 0 ? " (${result.attemptsMade} محاولات)" : ""}',
-        color: AppTheme.red,
       );
     }
   }
 
+  // ═══════════════════════════════════════════════════════
+  //  Dialogs
+  // ═══════════════════════════════════════════════════════
   void _openRadiusDialog() {
     double temp = _settings.radiusTiles.toDouble();
     showDialog(
@@ -650,9 +1362,8 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
               value: temp,
               min: kSamuraiRadiusMin.toDouble(),
               max: kSamuraiRadiusMax.toDouble(),
-              divisions:
-                  (kSamuraiRadiusMax - kSamuraiRadiusMin) ~/
-                      kSamuraiRadiusStep,
+              divisions: (kSamuraiRadiusMax - kSamuraiRadiusMin) ~/
+                  kSamuraiRadiusStep,
               activeColor: kSamuraiRed,
               label: '${temp.toInt()}',
               onChanged: (v) => setSt(() => temp =
@@ -692,70 +1403,60 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
           backgroundColor: Theme.of(ctx).colorScheme.surface,
           title: const Text('فلاتر المسح',
               style: TextStyle(decoration: TextDecoration.none)),
-          content: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                // Max level
-                Row(children: [
-                  const Text('Max Level:',
-                      style: TextStyle(
-                          color: Colors.white70,
-                          fontSize: 13,
-                          decoration: TextDecoration.none)),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Slider(
-                      value: maxLevel.toDouble(),
-                      min: 1, max: 100,
-                      divisions: 99,
-                      activeColor: kSamuraiGold,
-                      label: '$maxLevel',
-                      onChanged: (v) => setSt(() => maxLevel = v.round()),
-                    ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(children: [
+                const Text('Max Level:',
+                    style: TextStyle(
+                        color: Colors.white70,
+                        fontSize: 13,
+                        decoration: TextDecoration.none)),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Slider(
+                    value: maxLevel.toDouble(),
+                    min: 1, max: 100,
+                    divisions: 99,
+                    activeColor: kSamuraiGold,
+                    label: '$maxLevel',
+                    onChanged: (v) =>
+                        setSt(() => maxLevel = v.round()),
                   ),
-                  Text('$maxLevel',
-                      style: const TextStyle(
-                          color: kSamuraiGold,
-                          fontWeight: FontWeight.bold,
-                          decoration: TextDecoration.none)),
-                ]),
-                // Skip player camps
-                SwitchListTile(
-                  contentPadding: EdgeInsets.zero,
-                  title: const Text('تجاهل قلاع اللاعبين',
-                      style: TextStyle(
-                          fontSize: 13,
-                          decoration: TextDecoration.none)),
-                  subtitle: const Text(
-                      'قلاع ملونة (ownerId != -1)',
-                      style: TextStyle(
-                          fontSize: 10,
-                          color: Colors.white54,
-                          decoration: TextDecoration.none)),
-                  value: skipPlayer,
-                  activeColor: kSamuraiGold,
-                  onChanged: (v) => setSt(() => skipPlayer = v),
                 ),
-                // ✅ Daimyo castles
-                SwitchListTile(
-                  contentPadding: EdgeInsets.zero,
-                  title: const Text('هجوم قلاع الدايميو (37/38)',
-                      style: TextStyle(
-                          fontSize: 13,
-                          decoration: TextDecoration.none)),
-                  subtitle: const Text(
-                      '⚠️ قلاع لاعبين — يفضل OFF',
-                      style: TextStyle(
-                          fontSize: 10,
-                          color: Colors.orange,
-                          decoration: TextDecoration.none)),
-                  value: includeDaimyo,
-                  activeColor: Colors.orange,
-                  onChanged: (v) => setSt(() => includeDaimyo = v),
-                ),
-              ],
-            ),
+                Text('$maxLevel',
+                    style: const TextStyle(
+                        color: kSamuraiGold,
+                        fontWeight: FontWeight.bold,
+                        decoration: TextDecoration.none)),
+              ]),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('تجاهل قلاع اللاعبين',
+                    style: TextStyle(
+                        fontSize: 13,
+                        decoration: TextDecoration.none)),
+                value: skipPlayer,
+                activeColor: kSamuraiGold,
+                onChanged: (v) => setSt(() => skipPlayer = v),
+              ),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('عرض قلاع الدايميو (37/38)',
+                    style: TextStyle(
+                        fontSize: 13,
+                        decoration: TextDecoration.none)),
+                subtitle: const Text(
+                    '⚠️ مش هتتهاجم في الـ Auto',
+                    style: TextStyle(
+                        fontSize: 10,
+                        color: Colors.orange,
+                        decoration: TextDecoration.none)),
+                value: includeDaimyo,
+                activeColor: Colors.orange,
+                onChanged: (v) => setSt(() => includeDaimyo = v),
+              ),
+            ],
           ),
           actions: [
             TextButton(
@@ -781,23 +1482,176 @@ class _SamuraiScreenState extends State<SamuraiScreen> {
 }
 
 // ═══════════════════════════════════════════════════════
-//  Attack Sheet
+//  Multi-select sheet
+// ═══════════════════════════════════════════════════════
+class _SelectItem {
+  final int id;
+  final String label;
+  final String? subtitle;
+  _SelectItem({required this.id, required this.label, this.subtitle});
+}
+
+class _MultiSelectSheet extends StatefulWidget {
+  final String title;
+  final List<_SelectItem> items;
+  final Set<int> selected;
+  final bool allowEmpty;
+  final bool emptyMeansAll;
+
+  const _MultiSelectSheet({
+    required this.title,
+    required this.items,
+    required this.selected,
+    this.allowEmpty = true,
+    this.emptyMeansAll = false,
+  });
+
+  @override
+  State<_MultiSelectSheet> createState() => _MultiSelectSheetState();
+}
+
+class _MultiSelectSheetState extends State<_MultiSelectSheet> {
+  late Set<int> _sel;
+
+  @override
+  void initState() {
+    super.initState();
+    _sel = Set.from(widget.selected);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: MediaQuery.of(context).size.height * 0.8,
+      decoration: const BoxDecoration(
+        color: Color(0xFF0B0B14),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      child: SafeArea(
+        top: false,
+        child: Column(children: [
+          Container(
+              width: 44, height: 5,
+              margin: const EdgeInsets.only(top: 10, bottom: 12),
+              decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.2),
+                  borderRadius: BorderRadius.circular(3))),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Row(children: [
+              const Icon(Icons.checklist_rounded,
+                  color: kSamuraiGold, size: 20),
+              const SizedBox(width: 8),
+              Expanded(
+                  child: Text(widget.title,
+                      style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 15,
+                          fontWeight: FontWeight.bold,
+                          decoration: TextDecoration.none))),
+              TextButton(
+                onPressed: () {
+                  setState(() {
+                    if (_sel.length == widget.items.length) {
+                      _sel.clear();
+                    } else {
+                      _sel = widget.items.map((e) => e.id).toSet();
+                    }
+                  });
+                },
+                child: Text(_sel.length == widget.items.length
+                    ? 'إلغاء الكل'
+                    : 'تحديد الكل',
+                    style: const TextStyle(
+                        color: kSamuraiGold, fontSize: 11)),
+              ),
+            ]),
+          ),
+          const Divider(color: Colors.white12),
+          Expanded(
+            child: ListView.builder(
+              itemCount: widget.items.length,
+              itemBuilder: (_, i) {
+                final it = widget.items[i];
+                final sel = _sel.contains(it.id);
+                return CheckboxListTile(
+                  value: sel,
+                  activeColor: kSamuraiGold,
+                  title: Text(it.label,
+                      style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 13,
+                          decoration: TextDecoration.none)),
+                  subtitle: it.subtitle != null
+                      ? Text(it.subtitle!,
+                          style: const TextStyle(
+                              color: Colors.white54,
+                              fontSize: 10,
+                              decoration: TextDecoration.none))
+                      : null,
+                  onChanged: (v) {
+                    setState(() {
+                      if (v == true) {
+                        _sel.add(it.id);
+                      } else {
+                        _sel.remove(it.id);
+                      }
+                    });
+                  },
+                );
+              },
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.all(12),
+            child: Row(children: [
+              Expanded(
+                child: OutlinedButton(
+                  onPressed: () => Navigator.pop(context),
+                  style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.white70,
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12))),
+                  child: const Text('إلغاء'),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: ElevatedButton(
+                  onPressed: () => Navigator.pop(context, _sel),
+                  style: ElevatedButton.styleFrom(
+                      backgroundColor: kSamuraiGold,
+                      foregroundColor: Colors.black,
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12))),
+                  child: const Text('حفظ',
+                      style: TextStyle(fontWeight: FontWeight.bold)),
+                ),
+              ),
+            ]),
+          ),
+        ]),
+      ),
+    );
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+//  Attack sheet (manual)
 // ═══════════════════════════════════════════════════════
 class _SamuraiAttackSheet extends StatefulWidget {
   final GgeClient client;
   final OwnedCastle source;
   final SamuraiCamp camp;
   final SamuraiService svc;
-  final SamuraiAttackConfig defaultConfig;
-  final ValueChanged<SamuraiAttackConfig> onConfigChanged;
 
   const _SamuraiAttackSheet({
     required this.client,
     required this.source,
     required this.camp,
     required this.svc,
-    required this.defaultConfig,
-    required this.onConfigChanged,
   });
 
   @override
@@ -809,9 +1663,13 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
   List<CommanderInfo> _commanders = [];
   Lord? _selectedLord;
 
-  late SamuraiAttackConfig _config;
-  int? _manualLevel;
+  int _waves = 3;
+  int _toolL = 20;
+  int _toolR = 20;
+  int _toolM = 30;
+  bool _useTools = true;
 
+  int? _manualLevel;
   bool _loading = true;
   bool _sending = false;
   String? _lastError;
@@ -819,7 +1677,6 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
   @override
   void initState() {
     super.initState();
-    _config = widget.defaultConfig;
     _manualLevel =
         widget.camp.level > 0 ? widget.camp.level : null;
     _load();
@@ -841,7 +1698,8 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
         final free = cmds.where((c) => !c.isBusy).toList();
         if (free.isNotEmpty) {
           try {
-            _selectedLord = free.firstWhere((c) => c.lord.id != 0).lord;
+            _selectedLord =
+                free.firstWhere((c) => c.lord.id != 0).lord;
           } catch (_) {
             _selectedLord = free.first.lord;
           }
@@ -853,8 +1711,7 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
     }
   }
 
-  int get _totalUnits =>
-      _units.fold<int>(0, (s, u) => s + u.amount);
+  int get _totalUnits => _units.fold<int>(0, (s, u) => s + u.amount);
 
   int get _effectiveLevel {
     final m = _manualLevel ?? 0;
@@ -865,13 +1722,6 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
   }
 
   Future<void> _attack() async {
-    // ✅ تحقق من Daimyo
-    if (widget.camp.isDaimyoCastle && !_config.attackDaimyoCastles) {
-      setState(() => _lastError =
-          'هذا Daimyo Castle (لاعب) — مش بنهجم عليه افتراضيًا. افتح الفلاتر لو عايز.');
-      return;
-    }
-
     if (_selectedLord == null) {
       setState(() => _lastError = 'اختر قائد');
       return;
@@ -881,11 +1731,10 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
       return;
     }
     if (_effectiveLevel <= 0) {
-      setState(() => _lastError = 'محتاج تحدد Level المعسكر يدويًا');
+      setState(() =>
+          _lastError = 'محتاج تحدد Level المعسكر يدويًا');
       return;
     }
-
-    widget.onConfigChanged(_config);
 
     setState(() {
       _sending = true;
@@ -897,13 +1746,21 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
         .map((c) => c.lord)
         .toList();
 
+    final config = SamuraiAttackConfig(
+      waves: _waves,
+      toolId: _useTools ? 166 : null,
+      toolL: _toolL,
+      toolR: _toolR,
+      toolM: _toolM,
+    );
+
     final res = await widget.svc.attack(
       camp: widget.camp,
       source: widget.source,
       lordId: _selectedLord!.id,
       fallbackLords: fallbackLords,
       availableUnits: _units,
-      config: _config,
+      config: config,
       manualLevel: _manualLevel,
     );
 
@@ -920,8 +1777,6 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
   @override
   Widget build(BuildContext context) {
     final c = widget.camp;
-    final isDaimyo = c.isDaimyoCastle;
-
     return DraggableScrollableSheet(
       initialChildSize: 0.9,
       minChildSize: 0.5,
@@ -946,16 +1801,11 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
                 Container(
                   width: 40, height: 40,
                   decoration: BoxDecoration(
-                    gradient: LinearGradient(
-                        colors: isDaimyo
-                            ? [Colors.orange, Colors.deepOrange]
-                            : [kSamuraiRed, kSamuraiDark]),
+                    gradient: const LinearGradient(
+                        colors: [kSamuraiRed, kSamuraiDark]),
                     borderRadius: BorderRadius.circular(10),
                   ),
-                  child: Icon(
-                      isDaimyo
-                          ? Icons.account_balance_rounded
-                          : Icons.shield_rounded,
+                  child: const Icon(Icons.shield_rounded,
                       color: Colors.white, size: 20),
                 ),
                 const SizedBox(width: 10),
@@ -971,8 +1821,8 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
                               decoration: TextDecoration.none)),
                       Text(
                           'Lv ${_effectiveLevel}'
-                          '${c.type != kSamuraiCampType ? " · HP ${c.hp}" : ""}'
-                          ' · ${_totalUnits} وحدة متاحة',
+                          '${c.type != 29 ? " · HP ${c.hp}" : ""}'
+                          ' · $_totalUnits وحدة',
                           style: const TextStyle(
                               color: Colors.white54,
                               fontSize: 11,
@@ -981,7 +1831,8 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
                   ),
                 ),
                 IconButton(
-                    icon: const Icon(Icons.close, color: Colors.white70),
+                    icon:
+                        const Icon(Icons.close, color: Colors.white70),
                     onPressed: () => Navigator.pop(context)),
               ]),
             ),
@@ -989,13 +1840,14 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
             Expanded(
               child: _loading
                   ? const Center(
-                      child: CircularProgressIndicator(color: kSamuraiRed))
+                      child: CircularProgressIndicator(
+                          color: kSamuraiRed))
                   : ListView(
                       controller: scrollCtrl,
-                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 20),
+                      padding:
+                          const EdgeInsets.fromLTRB(16, 8, 16, 20),
                       children: [
                         if (_lastError != null) _errorBanner(),
-                        if (isDaimyo) _daimyoWarning(),
                         _levelCard(),
                         const SizedBox(height: 12),
                         _lordSection(),
@@ -1014,12 +1866,14 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
                   width: double.infinity,
                   height: 52,
                   child: ElevatedButton.icon(
-                    onPressed: _sending || _loading ? null : _attack,
+                    onPressed:
+                        _sending || _loading ? null : _attack,
                     icon: _sending
                         ? const SizedBox(
                             width: 18, height: 18,
                             child: CircularProgressIndicator(
-                                strokeWidth: 2, color: Colors.white))
+                                strokeWidth: 2,
+                                color: Colors.white))
                         : const Icon(Icons.gavel_rounded),
                     label: Text(
                         _sending ? 'جارٍ الإرسال...' : 'هجوم',
@@ -1028,8 +1882,7 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
                             fontSize: 15,
                             decoration: TextDecoration.none)),
                     style: ElevatedButton.styleFrom(
-                      backgroundColor:
-                          isDaimyo ? Colors.orange : kSamuraiRed,
+                      backgroundColor: kSamuraiRed,
                       foregroundColor: Colors.white,
                       shape: RoundedRectangleBorder(
                           borderRadius: BorderRadius.circular(14)),
@@ -1074,33 +1927,6 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
     );
   }
 
-  // ✅ تحذير Daimyo
-  Widget _daimyoWarning() {
-    return Container(
-      margin: const EdgeInsets.only(bottom: 10),
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: Colors.orange.withOpacity(0.15),
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: Colors.orange.withOpacity(0.5)),
-      ),
-      child: Row(children: [
-        const Icon(Icons.warning_amber_rounded,
-            color: Colors.orange, size: 20),
-        const SizedBox(width: 8),
-        const Expanded(
-          child: Text(
-              '⚠️ ده قلعة لاعب (Daimyo) مش NPC. الهجوم عليه ممكن يسبب خسائر بدون فايدة. متأكد؟',
-              style: TextStyle(
-                  color: Colors.orange,
-                  fontSize: 11,
-                  fontWeight: FontWeight.bold,
-                  decoration: TextDecoration.none)),
-        ),
-      ]),
-    );
-  }
-
   Widget _levelCard() {
     final autoLevel = widget.camp.level > 0 ? widget.camp.level : 0;
     final needManual = autoLevel <= 0;
@@ -1118,36 +1944,27 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
             color: needManual ? Colors.amber : Colors.green, size: 18),
         const SizedBox(width: 8),
         Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                  needManual
-                      ? 'Level غير معروف — أدخله يدويًا'
-                      : 'Level تلقائي: $autoLevel',
-                  style: TextStyle(
-                      color: needManual ? Colors.amber : Colors.green,
-                      fontSize: 12,
-                      fontWeight: FontWeight.bold,
-                      decoration: TextDecoration.none)),
-              if (needManual)
-                const Text(
-                    'الحد الأقصى للوحدات والأدوات يعتمد على Level',
-                    style: TextStyle(
-                        color: Colors.white54,
-                        fontSize: 10,
-                        decoration: TextDecoration.none)),
-            ],
-          ),
+          child: Text(
+              needManual
+                  ? 'Level غير معروف — أدخله يدويًا'
+                  : 'Level تلقائي: $autoLevel',
+              style: TextStyle(
+                  color: needManual ? Colors.amber : Colors.green,
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                  decoration: TextDecoration.none)),
         ),
         SizedBox(
           width: 70,
           child: TextFormField(
-            key: ValueKey('level_${_manualLevel ?? 0}'),
-            initialValue:
-                _manualLevel == null ? '' : _manualLevel.toString(),
+            key: ValueKey('lvl_${_manualLevel ?? 0}'),
+            initialValue: _manualLevel == null
+                ? ''
+                : _manualLevel.toString(),
             keyboardType: TextInputType.number,
-            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+            inputFormatters: [
+              FilteringTextInputFormatter.digitsOnly
+            ],
             textAlign: TextAlign.center,
             style: const TextStyle(
                 color: kSamuraiGold,
@@ -1158,10 +1975,12 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
               hintStyle: const TextStyle(
                   color: Colors.white30, fontSize: 11),
               isDense: true,
-              contentPadding: const EdgeInsets.symmetric(vertical: 8),
+              contentPadding:
+                  const EdgeInsets.symmetric(vertical: 8),
               enabledBorder: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(6),
-                  borderSide: const BorderSide(color: Colors.white24)),
+                  borderSide:
+                      const BorderSide(color: Colors.white24)),
               focusedBorder: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(6),
                   borderSide: const BorderSide(color: kSamuraiGold)),
@@ -1189,7 +2008,8 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           const Row(children: [
-            Icon(Icons.settings_rounded, color: kSamuraiGold, size: 16),
+            Icon(Icons.settings_rounded,
+                color: kSamuraiGold, size: 16),
             SizedBox(width: 6),
             Text('⚙️ إعدادات الأمر',
                 style: TextStyle(
@@ -1207,16 +2027,15 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
                     decoration: TextDecoration.none)),
             Expanded(
               child: Slider(
-                value: _config.waves.toDouble(),
+                value: _waves.toDouble(),
                 min: 1, max: 3, divisions: 2,
                 activeColor: kSamuraiRed,
-                label: '${_config.waves}',
-                onChanged: (v) => setState(() {
-                  _config = _config.copyWith(waves: v.round());
-                }),
+                label: '$_waves',
+                onChanged: (v) =>
+                    setState(() => _waves = v.round()),
               ),
             ),
-            Text('${_config.waves}',
+            Text('$_waves',
                 style: const TextStyle(
                     color: kSamuraiRed,
                     fontWeight: FontWeight.bold,
@@ -1224,65 +2043,36 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
           ]),
           SwitchListTile(
             contentPadding: EdgeInsets.zero,
-            title: const Text('استخدام أدوات الساموراي (166)',
+            title: const Text('استخدام الأدوات (166)',
                 style: TextStyle(
                     fontSize: 12, decoration: TextDecoration.none)),
             subtitle: Text(
-                _config.useTools
-                    ? 'كل wave: ${_config.toolsPerWave} أداة'
-                    : 'الأدوات متوقفة',
+                _useTools
+                    ? 'L $_toolL · M $_toolM · R $_toolR'
+                    : 'بدون أدوات',
                 style: const TextStyle(
                     fontSize: 10,
                     color: Colors.white54,
                     decoration: TextDecoration.none)),
-            value: _config.useTools,
+            value: _useTools,
             activeColor: kSamuraiGold,
-            onChanged: (v) => setState(() {
-              _config = v
-                  ? _config.copyWith(toolId: 166)
-                  : _config.copyWith(clearToolId: true);
-            }),
+            onChanged: (v) => setState(() => _useTools = v),
           ),
-          if (_config.useTools) ...[
+          if (_useTools) ...[
             const SizedBox(height: 4),
             Row(children: [
-              Expanded(child: _toolField('L', _config.toolL, (v) {
-                setState(() => _config = _config.copyWith(toolL: v));
+              Expanded(child: _toolField('L', _toolL, (v) {
+                setState(() => _toolL = v);
               })),
               const SizedBox(width: 6),
-              Expanded(child: _toolField('M', _config.toolM, (v) {
-                setState(() => _config = _config.copyWith(toolM: v));
+              Expanded(child: _toolField('M', _toolM, (v) {
+                setState(() => _toolM = v);
               })),
               const SizedBox(width: 6),
-              Expanded(child: _toolField('R', _config.toolR, (v) {
-                setState(() => _config = _config.copyWith(toolR: v));
+              Expanded(child: _toolField('R', _toolR, (v) {
+                setState(() => _toolR = v);
               })),
             ]),
-            const SizedBox(height: 6),
-            const Text(
-                'الحد الأقصى بيتظبط تلقائيًا حسب Level المعسكر',
-                style: TextStyle(
-                    fontSize: 10,
-                    color: Colors.white38,
-                    decoration: TextDecoration.none)),
-          ],
-          // ✅ Daimyo toggle
-          if (widget.camp.isDaimyoCastle) ...[
-            const Divider(color: Colors.white12),
-            SwitchListTile(
-              contentPadding: EdgeInsets.zero,
-              title: const Text('السماح بمهاجمة Daimyo',
-                  style: TextStyle(
-                      fontSize: 12,
-                      color: Colors.orange,
-                      decoration: TextDecoration.none)),
-              value: _config.attackDaimyoCastles,
-              activeColor: Colors.orange,
-              onChanged: (v) => setState(() {
-                _config =
-                    _config.copyWith(attackDaimyoCastles: v);
-              }),
-            ),
           ],
         ],
       ),
@@ -1315,10 +2105,7 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
           borderSide: const BorderSide(color: kSamuraiGold),
         ),
       ),
-      onChanged: (s) {
-        final v = int.tryParse(s) ?? 0;
-        onCh(v.clamp(0, 999));
-      },
+      onChanged: (s) => onCh(int.tryParse(s) ?? 0),
     );
   }
 
@@ -1328,8 +2115,6 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
     final maxFlank = SamuraiMath.flankMax(lvl);
     final maxMiddle = SamuraiMath.middleMax(lvl);
     final maxWave = maxFlank * 2 + maxMiddle;
-    final maxFlankTools = SamuraiMath.toolCapFlank(lvl);
-    final maxMiddleTools = SamuraiMath.toolCapMiddle(lvl);
 
     return Container(
       padding: const EdgeInsets.all(12),
@@ -1354,14 +2139,7 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
                   color: Colors.white70,
                   fontSize: 11,
                   decoration: TextDecoration.none)),
-          Text(
-              '• أدوات: أقصى $maxFlankTools للجناح · $maxMiddleTools للأمام',
-              style: const TextStyle(
-                  color: Colors.white70,
-                  fontSize: 11,
-                  decoration: TextDecoration.none)),
-          Text(
-              '• Waves: ${_config.waves} · إجمالي وحدة: $_totalUnits',
+          Text('• Waves: $_waves · إجمالي وحدة: $_totalUnits',
               style: const TextStyle(
                   color: Colors.white70,
                   fontSize: 11,
@@ -1400,7 +2178,8 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
                               fontSize: 13)),
                     ))
                 .toList(),
-            onChanged: (v) => setState(() => _selectedLord = v),
+            onChanged: (v) =>
+                setState(() => _selectedLord = v),
           ),
         ),
       ],
