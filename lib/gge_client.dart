@@ -619,6 +619,7 @@ class GgeClient {
     }
   }
 
+  // ✅✅✅ التعديل الوحيد في الملف: بيمرر role + category للهجمات
   void _extractUnits(dynamic arr, String position, List<AttackUnit> out) {
     if (arr is! List) return;
     for (final u in arr) {
@@ -626,11 +627,14 @@ class GgeClient {
       final id = _asInt(u[0]);
       final amt = _asInt(u[1]);
       if (id > 0 && amt > 0) {
+        final info = _cachedCatalog?[id];
         out.add(AttackUnit(
           wodId: id,
           amount: amt,
           position: position,
-          name: _cachedCatalog?[id]?.displayName,
+          name: info?.displayName,
+          role: info?.role,              // ✅ جديد
+          category: info?.categoryShort, // ✅ جديد (O-M / O-R / D-M / D-R)
         ));
       }
     }
@@ -912,7 +916,6 @@ class GgeClient {
     return completer.future;
   }
 
-  // ✅✅✅ _sendXtAndWait مع predicate اختياري
   Future<XtMessage> _sendXtAndWait(
     String cmd,
     String payload, {
@@ -927,7 +930,6 @@ class GgeClient {
 
     sub = _xtCtrl.stream.listen((m) {
       if (m.command != responseCmd) return;
-      // ✅✅✅ فلترة إضافية للردود
       if (predicate != null && !predicate(m)) return;
       if (completer.isCompleted) return;
       timer?.cancel();

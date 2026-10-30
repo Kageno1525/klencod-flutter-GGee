@@ -1,12 +1,10 @@
 import 'dart:async';
-import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:gge/gge_client.dart';
 import 'package:gge/models.dart';
 import 'package:gge/services/samurai_service.dart';
 import 'package:gge/services/samurai_auto_service.dart';
-import 'package:gge/services/background_service.dart';
 import 'package:gge/theme.dart';
 import 'package:gge/widgets/animated_widgets.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -26,6 +24,7 @@ class SamuraiScreen extends StatefulWidget {
 class _SamuraiScreenState extends State<SamuraiScreen>
     with TickerProviderStateMixin {
   late final SamuraiService _svc;
+  late final SamuraiAutoService _auto;
   late SamuraiSettings _settings;
   late TabController _tabCtrl;
 
@@ -55,21 +54,18 @@ class _SamuraiScreenState extends State<SamuraiScreen>
   int _toolR = 20;
   int _toolM = 30;
 
-  // Background status
-  String _bgStatus = '—';
-  String _bgExtra = '';
-  bool _bgRunning = false;
-  Timer? _bgStatusTimer;
+  Timer? _statusTimer;
 
   @override
   void initState() {
     super.initState();
     _svc = SamuraiService(widget.client);
+    _auto = SamuraiAutoService.instance;
     _svc.loadCooldowns();
     _tabCtrl = TabController(length: 2, vsync: this);
     _tabCtrl.addListener(() => setState(() {}));
     _init();
-    _startBgStatusPolling();
+    _startStatusPolling();
   }
 
   Future<void> _init() async {
@@ -102,20 +98,19 @@ class _SamuraiScreenState extends State<SamuraiScreen>
   }
 
   Future<void> _loadAutoSettings() async {
-    final s = SamuraiAutoService.instance;
-    final enabled = await s.isEnabled();
-    final minUnits = await s.getMinUnits();
-    final delayMin = await s.getDelayMin();
-    final delayMax = await s.getDelayMax();
-    final maxLevel = await s.getMaxLevel();
-    final skipDaimyo = await s.getSkipDaimyo();
-    final maxAttacksDay = await s.getMaxAttacksDay();
-    final waves = await s.getWaves();
-    final toolId = await s.getToolId();
-    final toolL = await s.getToolL();
-    final toolR = await s.getToolR();
-    final toolM = await s.getToolM();
-    final commanders = await s.getCommanderIds();
+    final enabled = await _auto.isEnabled();
+    final minUnits = await _auto.getMinUnits();
+    final delayMin = await _auto.getDelayMin();
+    final delayMax = await _auto.getDelayMax();
+    final maxLevel = await _auto.getMaxLevel();
+    final skipDaimyo = await _auto.getSkipDaimyo();
+    final maxAttacksDay = await _auto.getMaxAttacksDay();
+    final waves = await _auto.getWaves();
+    final toolId = await _auto.getToolId();
+    final toolL = await _auto.getToolL();
+    final toolR = await _auto.getToolR();
+    final toolM = await _auto.getToolM();
+    final commanders = await _auto.getCommanderIds();
 
     if (!mounted) return;
     setState(() {
@@ -132,36 +127,27 @@ class _SamuraiScreenState extends State<SamuraiScreen>
       _toolR = toolR;
       _toolM = toolM;
       _selectedCommanderIds = commanders.toSet();
-      _bgRunning = BackgroundService.isRunning;
     });
   }
 
-  void _startBgStatusPolling() {
-    _bgStatusTimer?.cancel();
-    _bgStatusTimer = Timer.periodic(const Duration(seconds: 3), (_) async {
+  void _startStatusPolling() {
+    _statusTimer?.cancel();
+    _statusTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (!mounted) return;
-      try {
-        final running = BackgroundService.isRunning;
-        final status = await BackgroundService.readSamuraiStatus();
-        if (!mounted) return;
-        final newStatus = status['status']?.toString() ?? '—';
-        final newExtra = status['extra']?.toString() ?? '';
-        if (newStatus != _bgStatus ||
-            newExtra != _bgExtra ||
-            running != _bgRunning) {
-          setState(() {
-            _bgStatus = newStatus;
-            _bgExtra = newExtra;
-            _bgRunning = running;
-          });
-        }
-      } catch (_) {}
+      final status = _auto.statusNotifier.value;
+      final running = _auto.isRunning;
+      final enabled = _autoEnabled;
+      if (running != enabled) {
+        setState(() => _autoEnabled = running);
+      }
+      // status notifier + counts
+      setState(() {});
     });
   }
 
   @override
   void dispose() {
-    _bgStatusTimer?.cancel();
+    _statusTimer?.cancel();
     _tabCtrl.dispose();
     super.dispose();
   }
@@ -213,6 +199,7 @@ class _SamuraiScreenState extends State<SamuraiScreen>
   }
 
   void _snack(String msg, {Color? color}) {
+    if (!mounted) return;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(SnackBar(
@@ -226,7 +213,7 @@ class _SamuraiScreenState extends State<SamuraiScreen>
   }
 
   // ═══════════════════════════════════════════════════════
-  //  ✅ Auto toggle — RESTART background
+  //  Auto toggle — FOREGROUND (زي الصحراء)
   // ═══════════════════════════════════════════════════════
   Future<void> _toggleAuto() async {
     if (_source == null) {
@@ -239,75 +226,30 @@ class _SamuraiScreenState extends State<SamuraiScreen>
       return;
     }
 
-    final newValue = !_autoEnabled;
+    if (_autoEnabled) {
+      // إيقاف
+      _auto.stop();
+      await _auto.setEnabled(false);
+      if (mounted) {
+        setState(() => _autoEnabled = false);
+        _snack('⏸️ Auto متوقف', color: AppTheme.orange);
+      }
+      return;
+    }
 
-    // 1) حفظ المصدر
-    await SamuraiAutoService.instance.setSource(
+    // تشغيل
+    await _auto.setSource(
       areaId: _source!.areaId,
       kid: _source!.kingdomId,
       x: _source!.x,
       y: _source!.y,
     );
+    await _auto.setEnabled(true);
+    await _auto.start(widget.client, sourceAreaId: _source!.areaId);
 
-    // 2) حفظ enabled
-    await SamuraiAutoService.instance.setEnabled(newValue);
-
-    // 3) إعادة تشغيل الـ service دائمًا (لضمان قراءة settings جديدة)
-    if (newValue) {
-      // إظهار مؤشر تحميل
-      setState(() => _autoEnabled = newValue);
-
-      _snack('🔄 إعادة تشغيل الخلفية...', color: Colors.blue);
-
-      final ok = await BackgroundService.restart();
-
-      if (!ok) {
-        // فشل → رجّع الحالة
-        await SamuraiAutoService.instance.setEnabled(false);
-        if (mounted) {
-          setState(() => _autoEnabled = false);
-          _snack('❌ فشل تشغيل الخلفية — جرب تقفل التطبيق وتفتحه',
-              color: AppTheme.red);
-        }
-        return;
-      }
-
-      // انتظر 3 ثواني وتأكد
-      await Future.delayed(const Duration(seconds: 3));
-      final running = BackgroundService.isRunning;
-
-      if (!mounted) return;
-      setState(() => _bgRunning = running);
-
-      if (running) {
-        _snack('✅ Auto شغال — الخلفية بتهجم كل ${_delayMin}-${_delayMax} ث',
-            color: AppTheme.green);
-      } else {
-        _snack('⚠️ الخلفية مش شغالة — جرب restart يدوي',
-            color: AppTheme.orange);
-      }
-    } else {
-      // إيقاف
-      setState(() => _autoEnabled = false);
-      await BackgroundService.restart(); // restart بدون enabled = idle
-      _snack('⏸️ Auto متوقف', color: AppTheme.orange);
-    }
-  }
-
-  Future<void> _toggleBackgroundOnly() async {
-    if (_bgRunning) {
-      await BackgroundService.stop();
-      if (mounted) {
-        setState(() => _bgRunning = false);
-        _snack('⏹️ الخلفية متوقفة', color: AppTheme.orange);
-      }
-    } else {
-      final ok = await BackgroundService.start();
-      if (mounted) {
-        setState(() => _bgRunning = BackgroundService.isRunning);
-        _snack(ok ? '✅ الخلفية شغالة' : '❌ فشل التشغيل',
-            color: ok ? AppTheme.green : AppTheme.red);
-      }
+    if (mounted) {
+      setState(() => _autoEnabled = true);
+      _snack('✅ Auto شغال — بيهجم تلقائي', color: AppTheme.green);
     }
   }
 
@@ -357,7 +299,7 @@ class _SamuraiScreenState extends State<SamuraiScreen>
       ),
     );
     if (result == null) return;
-    await SamuraiAutoService.instance.setCommanderIds(result.toList());
+    await _auto.setCommanderIds(result.toList());
     if (mounted) setState(() => _selectedCommanderIds = result);
   }
 
@@ -539,8 +481,6 @@ class _SamuraiScreenState extends State<SamuraiScreen>
         const SizedBox(height: 10),
         _bigStatusCard(),
         const SizedBox(height: 10),
-        _bgServiceCard(),
-        const SizedBox(height: 10),
         _autoControlsCard(),
         const SizedBox(height: 10),
         _autoSettingsCard(),
@@ -551,23 +491,28 @@ class _SamuraiScreenState extends State<SamuraiScreen>
   }
 
   Widget _bigStatusCard() {
-    final isHealthy = _autoEnabled && _bgRunning;
+    final running = _auto.isRunning;
+    final status = _auto.statusNotifier.value;
+    final attacks = _auto.attacksThisSession;
+    final camps = _auto.campsScanned;
+    final errors = _auto.statusHistory
+        .where((e) => e.message.startsWith('❌'))
+        .length;
+
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
         gradient: LinearGradient(
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
-          colors: isHealthy
+          colors: running
               ? [const Color(0xFF16A34A), const Color(0xFF15803D)]
-              : _autoEnabled
-                  ? [Colors.orange, Colors.deepOrange]
-                  : [const Color(0xFF37474F), const Color(0xFF546E7A)],
+              : [const Color(0xFF37474F), const Color(0xFF546E7A)],
         ),
         borderRadius: BorderRadius.circular(16),
         boxShadow: [
           BoxShadow(
-            color: (isHealthy ? Colors.green : Colors.grey).withOpacity(0.3),
+            color: (running ? Colors.green : Colors.grey).withOpacity(0.3),
             blurRadius: 20,
             offset: const Offset(0, 8),
           ),
@@ -584,11 +529,7 @@ class _SamuraiScreenState extends State<SamuraiScreen>
                 borderRadius: BorderRadius.circular(10),
               ),
               child: Icon(
-                  isHealthy
-                      ? Icons.bolt_rounded
-                      : _autoEnabled
-                          ? Icons.warning_amber_rounded
-                          : Icons.pause_rounded,
+                  running ? Icons.bolt_rounded : Icons.pause_rounded,
                   color: Colors.white,
                   size: 24),
             ),
@@ -598,22 +539,16 @@ class _SamuraiScreenState extends State<SamuraiScreen>
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                      isHealthy
-                          ? 'Auto يعمل ✓'
-                          : _autoEnabled
-                              ? 'Auto مفعل لكن الخلفية متوقفة'
-                              : 'Auto متوقف',
+                      running ? 'Auto يعمل ✓' : 'Auto متوقف',
                       style: const TextStyle(
                           color: Colors.white,
-                          fontSize: 15,
+                          fontSize: 16,
                           fontWeight: FontWeight.bold,
                           decoration: TextDecoration.none)),
                   Text(
-                      isHealthy
-                          ? 'هجمات كل $_delayMin-${_delayMax}s'
-                          : _autoEnabled
-                              ? 'اضغط زر الخلفية تحت'
-                              : 'في انتظار التشغيل',
+                      running
+                          ? 'هجمات كل $_delayMin-${_delayMax}s · $attacks هجمة'
+                          : 'في انتظار التشغيل',
                       style: const TextStyle(
                           color: Colors.white70,
                           fontSize: 11,
@@ -628,7 +563,7 @@ class _SamuraiScreenState extends State<SamuraiScreen>
                 color: Colors.white.withOpacity(0.2),
                 borderRadius: BorderRadius.circular(8),
               ),
-              child: Text(isHealthy ? 'ON' : (_autoEnabled ? '⚠' : 'OFF'),
+              child: Text(running ? 'ON' : 'OFF',
                   style: const TextStyle(
                       color: Colors.white,
                       fontSize: 11,
@@ -647,107 +582,50 @@ class _SamuraiScreenState extends State<SamuraiScreen>
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text('آخر status من الخلفية',
+                const Text('آخر status',
                     style: TextStyle(
                         color: Colors.white70,
                         fontSize: 10,
                         fontWeight: FontWeight.bold,
                         decoration: TextDecoration.none)),
                 const SizedBox(height: 4),
-                Text(_bgStatus,
+                Text(status,
                     style: const TextStyle(
                         color: Colors.white,
                         fontSize: 15,
                         fontWeight: FontWeight.bold,
                         decoration: TextDecoration.none)),
-                if (_bgExtra.isNotEmpty) ...[
-                  const SizedBox(height: 4),
-                  Text(_bgExtra,
-                      style: const TextStyle(
-                          color: Colors.white70,
-                          fontSize: 11,
-                          decoration: TextDecoration.none)),
-                ],
               ],
             ),
           ),
+          const SizedBox(height: 10),
+          Row(children: [
+            Expanded(
+                child: _miniStat('أبراج', camps.toString())),
+            Expanded(
+                child: _miniStat('هجمات', attacks.toString())),
+            Expanded(
+                child: _miniStat('أخطاء', errors.toString())),
+          ]),
         ],
       ),
     );
   }
 
-  Widget _bgServiceCard() {
-    return AppTheme.glassCard(
-      context: context,
-      padding: const EdgeInsets.all(14),
-      child: Column(children: [
-        Row(children: [
-          Container(
-            padding: const EdgeInsets.all(8),
-            decoration: BoxDecoration(
-              color: (_bgRunning ? Colors.green : kSamuraiGold)
-                  .withOpacity(0.15),
-              borderRadius: BorderRadius.circular(10),
-            ),
-            child: Icon(
-                _bgRunning
-                    ? Icons.check_circle_rounded
-                    : Icons.nightlight_round,
-                color: _bgRunning ? Colors.green : kSamuraiGold,
-                size: 18),
-          ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text('خدمة الخلفية',
-                    style: TextStyle(
-                        color: AppTheme.textColor(context),
-                        fontWeight: FontWeight.bold,
-                        fontSize: 14,
-                        decoration: TextDecoration.none)),
-                Text(_bgRunning ? '✓ شغالة' : '✗ متوقفة',
-                    style: TextStyle(
-                        color: _bgRunning
-                            ? Colors.green
-                            : AppTheme.subTextColor(context),
-                        fontSize: 11,
-                        decoration: TextDecoration.none)),
-              ],
-            ),
-          ),
-          Switch(
-            value: _bgRunning,
-            activeColor: kSamuraiGold,
-            onChanged: (_) => _toggleBackgroundOnly(),
-          ),
-        ]),
-        if (!_bgRunning && _autoEnabled) ...[
-          const SizedBox(height: 8),
-          Container(
-            padding: const EdgeInsets.all(10),
-            decoration: BoxDecoration(
-              color: Colors.orange.withOpacity(0.15),
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(color: Colors.orange.withOpacity(0.5)),
-            ),
-            child: const Row(children: [
-              Icon(Icons.warning_amber, color: Colors.orange, size: 16),
-              SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                    'Auto مفعل لكن الخلفية متوقفة — افتح التطبيق تاني أو أعد التشغيل',
-                    style: TextStyle(
-                        color: Colors.orange,
-                        fontSize: 11,
-                        decoration: TextDecoration.none)),
-              ),
-            ]),
-          ),
-        ],
-      ]),
-    );
+  Widget _miniStat(String label, String value) {
+    return Column(children: [
+      Text(value,
+          style: const TextStyle(
+              color: Colors.white,
+              fontSize: 20,
+              fontWeight: FontWeight.w900,
+              decoration: TextDecoration.none)),
+      Text(label,
+          style: const TextStyle(
+              color: Colors.white70,
+              fontSize: 10,
+              decoration: TextDecoration.none)),
+    ]);
   }
 
   Widget _autoControlsCard() {
@@ -777,6 +655,25 @@ class _SamuraiScreenState extends State<SamuraiScreen>
             ),
           ),
         ),
+        const SizedBox(height: 10),
+        SizedBox(
+          width: double.infinity,
+          height: 40,
+          child: OutlinedButton.icon(
+            onPressed: () => _showStatusHistory(context),
+            icon: const Icon(Icons.history_rounded, size: 16),
+            label: Text(
+                'عرض كل الـ status (${_auto.statusHistory.length})',
+                style: const TextStyle(
+                    fontSize: 12, decoration: TextDecoration.none)),
+            style: OutlinedButton.styleFrom(
+              foregroundColor: kSamuraiGold,
+              side: const BorderSide(color: kSamuraiGold),
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(10)),
+            ),
+          ),
+        ),
         if (!_autoEnabled && _selectedCommanderIds.isEmpty) ...[
           const SizedBox(height: 8),
           Container(
@@ -801,6 +698,93 @@ class _SamuraiScreenState extends State<SamuraiScreen>
           ),
         ],
       ]),
+    );
+  }
+
+  void _showStatusHistory(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => Container(
+        height: MediaQuery.of(context).size.height * 0.85,
+        decoration: const BoxDecoration(
+          color: Color(0xFF0B0B14),
+          borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+        ),
+        child: SafeArea(
+          top: false,
+          child: Column(children: [
+            Container(
+                width: 44, height: 5,
+                margin: const EdgeInsets.only(top: 10, bottom: 12),
+                decoration: BoxDecoration(
+                    color: Colors.white.withOpacity(0.2),
+                    borderRadius: BorderRadius.circular(3))),
+            const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 16),
+              child: Row(children: [
+                Icon(Icons.history_rounded, color: kSamuraiGold, size: 20),
+                SizedBox(width: 8),
+                Text('Status History',
+                    style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                        decoration: TextDecoration.none)),
+              ]),
+            ),
+            const SizedBox(height: 8),
+            Expanded(
+              child: Container(
+                margin: const EdgeInsets.symmetric(horizontal: 12),
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                    color: Colors.black,
+                    borderRadius: BorderRadius.circular(12),
+                    border:
+                        Border.all(color: Colors.white.withOpacity(0.08))),
+                child: _auto.statusHistory.isEmpty
+                    ? const Center(
+                        child: Text('لا يوجد سجل بعد',
+                            style: TextStyle(
+                                color: Colors.grey,
+                                fontFamily: 'monospace',
+                                fontSize: 11,
+                                decoration: TextDecoration.none)))
+                    : ListView.builder(
+                        itemCount: _auto.statusHistory.length,
+                        itemBuilder: (_, i) {
+                          final e = _auto.statusHistory[i];
+                          final t =
+                              '${e.at.hour.toString().padLeft(2, '0')}:${e.at.minute.toString().padLeft(2, '0')}:${e.at.second.toString().padLeft(2, '0')}';
+                          return Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 2),
+                            child: Row(children: [
+                              Text(t,
+                                  style: const TextStyle(
+                                      color: Colors.white38,
+                                      fontFamily: 'monospace',
+                                      fontSize: 10,
+                                      decoration: TextDecoration.none)),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                  child: Text(e.message,
+                                      style: const TextStyle(
+                                          color: Colors.white70,
+                                          fontSize: 11,
+                                          decoration:
+                                              TextDecoration.none))),
+                            ]),
+                          );
+                        },
+                      ),
+              ),
+            ),
+            const SizedBox(height: 12),
+          ]),
+        ),
+      ),
     );
   }
 
@@ -834,7 +818,7 @@ class _SamuraiScreenState extends State<SamuraiScreen>
               child: _numberField('أقل', '$_delayMin', _delayMin, (v) async {
                 if (v < 5) v = 5;
                 setState(() => _delayMin = v);
-                await SamuraiAutoService.instance.setDelay(min: v);
+                await _auto.setDelay(min: v);
               }),
             ),
             const SizedBox(width: 8),
@@ -842,7 +826,7 @@ class _SamuraiScreenState extends State<SamuraiScreen>
               child: _numberField('أكثر', '$_delayMax', _delayMax, (v) async {
                 if (v < _delayMin) v = _delayMin;
                 setState(() => _delayMax = v);
-                await SamuraiAutoService.instance.setDelay(max: v);
+                await _auto.setDelay(max: v);
               }),
             ),
           ]),
@@ -855,21 +839,21 @@ class _SamuraiScreenState extends State<SamuraiScreen>
             Expanded(
               child: _numberField('أقل وحدات', '$_minUnits', _minUnits, (v) async {
                 setState(() => _minUnits = v);
-                await SamuraiAutoService.instance.setMinUnits(v);
+                await _auto.setMinUnits(v);
               }),
             ),
             const SizedBox(width: 8),
             Expanded(
               child: _numberField('Max Lv', '$_maxLevel', _maxLevel, (v) async {
                 setState(() => _maxLevel = v);
-                await SamuraiAutoService.instance.setMaxLevel(v);
+                await _auto.setMaxLevel(v);
               }),
             ),
             const SizedBox(width: 8),
             Expanded(
               child: _numberField('يومي', '0=∞', _maxAttacksDay, (v) async {
                 setState(() => _maxAttacksDay = v);
-                await SamuraiAutoService.instance.setMaxAttacksDay(v);
+                await _auto.setMaxAttacksDay(v);
               }),
             ),
           ]),
@@ -893,7 +877,7 @@ class _SamuraiScreenState extends State<SamuraiScreen>
                 onChanged: (v) async {
                   final w = v.round();
                   setState(() => _waves = w);
-                  await SamuraiAutoService.instance.setWaves(w);
+                  await _auto.setWaves(w);
                 },
               ),
             ),
@@ -928,16 +912,14 @@ class _SamuraiScreenState extends State<SamuraiScreen>
                   _toolR = 20;
                   _toolM = 30;
                 });
-                await SamuraiAutoService.instance
-                    .setToolAmounts(l: 20, r: 20, m: 30);
+                await _auto.setToolAmounts(l: 20, r: 20, m: 30);
               } else {
                 setState(() {
                   _toolL = 0;
                   _toolR = 0;
                   _toolM = 0;
                 });
-                await SamuraiAutoService.instance
-                    .setToolAmounts(l: 0, r: 0, m: 0);
+                await _auto.setToolAmounts(l: 0, r: 0, m: 0);
               }
             },
           ),
@@ -947,21 +929,21 @@ class _SamuraiScreenState extends State<SamuraiScreen>
               Expanded(
                 child: _numberField('L', '$_toolL', _toolL, (v) async {
                   setState(() => _toolL = v);
-                  await SamuraiAutoService.instance.setToolAmounts(l: v);
+                  await _auto.setToolAmounts(l: v);
                 }),
               ),
               const SizedBox(width: 6),
               Expanded(
                 child: _numberField('M', '$_toolM', _toolM, (v) async {
                   setState(() => _toolM = v);
-                  await SamuraiAutoService.instance.setToolAmounts(m: v);
+                  await _auto.setToolAmounts(m: v);
                 }),
               ),
               const SizedBox(width: 6),
               Expanded(
                 child: _numberField('R', '$_toolR', _toolR, (v) async {
                   setState(() => _toolR = v);
-                  await SamuraiAutoService.instance.setToolAmounts(r: v);
+                  await _auto.setToolAmounts(r: v);
                 }),
               ),
             ]),
@@ -984,7 +966,7 @@ class _SamuraiScreenState extends State<SamuraiScreen>
             activeColor: Colors.green,
             onChanged: (v) async {
               setState(() => _skipDaimyo = v);
-              await SamuraiAutoService.instance.setSkipDaimyo(v);
+              await _auto.setSkipDaimyo(v);
             },
           ),
         ],
@@ -1129,7 +1111,7 @@ class _SamuraiScreenState extends State<SamuraiScreen>
                       _settings.sourceAreaId = v.areaId;
                       _settings.save();
                     });
-                    await SamuraiAutoService.instance.setSource(
+                    await _auto.setSource(
                       areaId: v.areaId,
                       kid: v.kingdomId,
                       x: v.x,

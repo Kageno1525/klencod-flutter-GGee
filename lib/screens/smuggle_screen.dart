@@ -38,8 +38,9 @@ class _SmuggleScreenState extends State<SmuggleScreen> {
   bool _sending = false;
 
   int _hiddenUnitsCount = 0;
+  int _unknownUnitsCount = 0;
 
-  // ✅ فلتر الجنود: all | offense | defense
+  // ✅ فلتر الجنود: all | off | def | melee | ranged
   String _unitFilter = 'all';
 
   // ✅ فلتر الأعضاء: all | peace
@@ -134,25 +135,16 @@ class _SmuggleScreenState extends State<SmuggleScreen> {
     }
   }
 
-  /// ✅ White-list: فقط الجنود اللي role=melee/ranged.
-  ///    الأدوات (Shields, Chests, Boosts, Ram, Ladder) كلها role مختلف → بتختفي.
+  /// ✅ ما نستبعدش حاجة بسبب الكتالوج الناقص.
+  ///   • لو info == null → نظهره كـ "Unknown" (بدل ما نخفيه).
+  ///   • نستبعد بس الجدران/البوابات/الخنادق (مباني مش جنود).
+  ///   • نقبل كل الجنود القتالية (offense + defense).
   bool _isSendableForSmuggle(CastleUnit u) {
-  final info = u.info;
-  if (info == null) return false;
-
-  // ✅ يقبل كل الجنود القتالية (هجوم + دفاع)
-  if (!u.isCombat) return false;
-
-  // ✅ يستبعد الجدران/البوابات/الخنادق (مش جنود — مباني دفاعية)
-  final type = info.type ?? '';
-  if (type.contains('Wall') ||
-      type.contains('Gate') ||
-      type.contains('Moat')) {
-    return false;
+    final info = u.info;
+    if (info == null) return true; // ✅ نعرضه بدل ما نخفيه
+    if (info.isWallType) return false; // ✅ سور/بوابة/خندق → استبعاد
+    return info.isCombat;
   }
-
-  return true;
-}
 
   Future<void> _loadUnits() async {
     if (_source == null) return;
@@ -160,6 +152,7 @@ class _SmuggleScreenState extends State<SmuggleScreen> {
       _loadingUnits = true;
       _units = [];
       _hiddenUnitsCount = 0;
+      _unknownUnitsCount = 0;
       for (final c in _amtCtrl.values) c.dispose();
       _amtCtrl.clear();
     });
@@ -170,17 +163,36 @@ class _SmuggleScreenState extends State<SmuggleScreen> {
 
       final sendable = <CastleUnit>[];
       int hidden = 0;
+      int unknown = 0;
       for (final u in rawUnits) {
         if (_isSendableForSmuggle(u)) {
           sendable.add(u);
+          if (u.isUnknown) unknown++;
         } else {
           hidden++;
         }
       }
 
+      // ✅ ترتيب: O-M → O-R → D-M → D-R → siege → unknown
+      sendable.sort((a, b) {
+        int rank(CastleUnit u) {
+          if (u.isUnknown) return 5;
+          final info = u.info;
+          if (info == null) return 5;
+          if (info.source == 'siege') return 4;
+          if (u.isOffensive && u.isMelee) return 0;
+          if (u.isOffensive && u.isRanged) return 1;
+          if (u.isDefensive && u.isMelee) return 2;
+          if (u.isDefensive && u.isRanged) return 3;
+          return 4;
+        }
+        return rank(a).compareTo(rank(b));
+      });
+
       setState(() {
         _units = sendable;
         _hiddenUnitsCount = hidden;
+        _unknownUnitsCount = unknown;
         for (final u in sendable) {
           _amtCtrl[u.wodId] = TextEditingController(text: '0');
         }
@@ -209,7 +221,6 @@ class _SmuggleScreenState extends State<SmuggleScreen> {
     }
   }
 
-  /// ✅ فلترة + ترتيب الأعضاء
   List<AllyMember> get _filteredMembers {
     var list = _memberFilter == 'peace'
         ? _members.where((m) => m.hasPeace).toList()
@@ -231,12 +242,17 @@ class _SmuggleScreenState extends State<SmuggleScreen> {
     return list;
   }
 
+  /// ✅ الفلترة الجديدة (5 خيارات)
   List<CastleUnit> get _filteredUnits {
     switch (_unitFilter) {
-      case 'offense':
-        return _units.where((u) => u.isCombat && !u.isDefensive).toList();
-      case 'defense':
-        return _units.where((u) => u.isCombat && u.isDefensive).toList();
+      case 'off':
+        return _units.where((u) => u.isOffensive).toList();
+      case 'def':
+        return _units.where((u) => u.isDefensive).toList();
+      case 'melee':
+        return _units.where((u) => u.isMelee).toList();
+      case 'ranged':
+        return _units.where((u) => u.isRanged).toList();
       default:
         return _units;
     }
@@ -260,22 +276,22 @@ class _SmuggleScreenState extends State<SmuggleScreen> {
     return t;
   }
 
+  /// ✅ تحديد الكل = يحدد الجنود القتالية في الفلتر الحالي فقط
   void _selectAllUnits() {
     for (final c in _amtCtrl.values) c.text = '0';
-    final offensive =
-        _filteredUnits.where((u) => u.isCombat && !u.isDefensive).toList();
-    final defensive =
-        _filteredUnits.where((u) => u.isCombat && u.isDefensive).toList();
-    final ordered = [...offensive, ...defensive];
-    for (final u in ordered.take(kMaxUnitTypes)) {
+    final toSelect = _filteredUnits
+        .where((u) => u.isCombat) // يستبعد الـ unknown والجدران
+        .take(kMaxUnitTypes)
+        .toList();
+    for (final u in toSelect) {
       _amtCtrl[u.wodId]?.text = u.amount.toString();
     }
     setState(() {});
-    if (ordered.length > kMaxUnitTypes) {
+    if (toSelect.length < _filteredUnits.where((u) => u.amount > 0).length) {
       _snack(
         S.isAr
-            ? 'تم تحديد $kMaxUnitTypes أنواع فقط (الحد الأقصى)'
-            : 'Only $kMaxUnitTypes types selected (max)',
+            ? 'تم تحديد ${toSelect.length} نوع فقط (${kMaxUnitTypes} كحد أقصى)'
+            : 'Only ${toSelect.length} types selected (max $kMaxUnitTypes)',
         color: AppTheme.orange,
       );
     }
@@ -481,7 +497,8 @@ class _SmuggleScreenState extends State<SmuggleScreen> {
                         color: AppTheme.textColor(context),
                         letterSpacing: -0.3,
                         decoration: TextDecoration.none)),
-                Text('${_filteredMembers.length} / ${_members.length} ${S.allianceMembers}',
+                Text(
+                    '${_filteredMembers.length} / ${_members.length} ${S.allianceMembers}',
                     style: TextStyle(
                         fontSize: 11,
                         color: AppTheme.subTextColor(context),
@@ -613,6 +630,7 @@ class _SmuggleScreenState extends State<SmuggleScreen> {
                       _source = v;
                       _units = [];
                       _hiddenUnitsCount = 0;
+                      _unknownUnitsCount = 0;
                       for (final c in _amtCtrl.values) c.dispose();
                       _amtCtrl.clear();
                     });
@@ -789,7 +807,6 @@ class _SmuggleScreenState extends State<SmuggleScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // Header row: title + filter chips + sort
           Row(children: [
             Container(
                 width: 32,
@@ -951,6 +968,7 @@ class _SmuggleScreenState extends State<SmuggleScreen> {
           _targetCastle = sameKingdom;
           _units = [];
           _hiddenUnitsCount = 0;
+          _unknownUnitsCount = 0;
           for (final c in _amtCtrl.values) c.dispose();
           _amtCtrl.clear();
         });
@@ -1148,9 +1166,11 @@ class _SmuggleScreenState extends State<SmuggleScreen> {
             ),
           ]),
           const SizedBox(height: 12),
+
+          // ✅ بانرات التحذير
           if (_hiddenUnitsCount > 0)
             Padding(
-              padding: const EdgeInsets.only(bottom: 10),
+              padding: const EdgeInsets.only(bottom: 8),
               child: Container(
                 padding: const EdgeInsets.all(10),
                 decoration: BoxDecoration(
@@ -1174,12 +1194,47 @@ class _SmuggleScreenState extends State<SmuggleScreen> {
                 ]),
               ),
             ),
+          if (_unknownUnitsCount > 0)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                    color: AppTheme.blue.withOpacity(0.1),
+                    borderRadius: BorderRadius.circular(10),
+                    border:
+                        Border.all(color: AppTheme.blue.withOpacity(0.3))),
+                child: Row(children: [
+                  const Icon(Icons.help_outline_rounded,
+                      color: AppTheme.blue, size: 16),
+                  const SizedBox(width: 8),
+                  Expanded(
+                      child: Text(
+                          S.isAr
+                              ? '$_unknownUnitsCount جندي مش موجود في الكتالوج — لو بعتهم ممكن يرفض'
+                              : '$_unknownUnitsCount unit(s) not in catalog — may fail to send',
+                          style: const TextStyle(
+                              color: AppTheme.blue,
+                              fontSize: 10.5,
+                              decoration: TextDecoration.none))),
+                ]),
+              ),
+            ),
+
+          // ✅ فلتر 5 خيارات
+          Wrap(
+            spacing: 6,
+            runSpacing: 6,
+            children: [
+              _unitChip(context, 'all', S.allUnits),
+              _unitChip(context, 'off', S.isAr ? 'هجوم' : 'Offense'),
+              _unitChip(context, 'def', S.isAr ? 'دفاع' : 'Defense'),
+              _unitChip(context, 'melee', S.isAr ? 'اشتباك' : 'Melee'),
+              _unitChip(context, 'ranged', S.isAr ? 'رماح' : 'Ranged'),
+            ],
+          ),
+          const SizedBox(height: 8),
           Row(children: [
-            _unitChip(context, 'all', S.allUnits),
-            const SizedBox(width: 6),
-            _unitChip(context, 'offense', S.offenseOnly),
-            const SizedBox(width: 6),
-            _unitChip(context, 'defense', S.defenseOnly),
             const Spacer(),
             InkWell(
               onTap: _selectAllUnits,
@@ -1284,6 +1339,7 @@ class _SmuggleScreenState extends State<SmuggleScreen> {
   }
 
   Widget _unitRow(BuildContext context, CastleUnit u) {
+    final catColor = u.categoryColor;
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
       padding: const EdgeInsets.all(10),
@@ -1293,30 +1349,52 @@ class _SmuggleScreenState extends State<SmuggleScreen> {
             .surface
             .withOpacity(AppTheme.isDark(context) ? 0.5 : 0.85),
         borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: u.roleColor.withOpacity(0.2)),
+        border: Border.all(color: catColor.withOpacity(0.35)),
       ),
       child: Row(children: [
         Container(
             width: 38,
             height: 38,
             decoration: BoxDecoration(
-                color: u.roleColor.withOpacity(0.18),
+                color: catColor.withOpacity(0.18),
                 borderRadius: BorderRadius.circular(10),
-                border: Border.all(color: u.roleColor.withOpacity(0.4))),
-            child: Icon(u.icon, color: u.roleColor, size: 20)),
+                border: Border.all(color: catColor.withOpacity(0.4))),
+            child: Icon(u.icon, color: catColor, size: 20)),
         const SizedBox(width: 10),
         Expanded(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text(S.unitName(u.displayName),
-                  style: TextStyle(
-                      color: AppTheme.textColor(context),
-                      fontWeight: FontWeight.bold,
-                      fontSize: 12,
-                      decoration: TextDecoration.none),
-                  overflow: TextOverflow.ellipsis),
-              Text('${S.available}: ${u.amount}',
+              Row(children: [
+                Flexible(
+                  child: Text(S.unitName(u.displayName),
+                      style: TextStyle(
+                          color: AppTheme.textColor(context),
+                          fontWeight: FontWeight.bold,
+                          fontSize: 12,
+                          decoration: TextDecoration.none),
+                      overflow: TextOverflow.ellipsis),
+                ),
+                const SizedBox(width: 6),
+                // ✅ البادج: O-M / O-R / D-M / D-R / SG / W / ?
+                Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                  decoration: BoxDecoration(
+                    color: catColor.withOpacity(0.18),
+                    borderRadius: BorderRadius.circular(5),
+                    border: Border.all(color: catColor.withOpacity(0.5)),
+                  ),
+                  child: Text(u.categoryShort,
+                      style: TextStyle(
+                          color: catColor,
+                          fontSize: 9,
+                          fontWeight: FontWeight.w900,
+                          letterSpacing: 0.3,
+                          decoration: TextDecoration.none)),
+                ),
+              ]),
+              Text('${S.available}: ${u.amount}  ·  ${u.categoryLabel}',
                   style: TextStyle(
                       color: AppTheme.subTextColor(context),
                       fontSize: 10,

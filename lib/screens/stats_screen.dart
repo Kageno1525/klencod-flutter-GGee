@@ -275,12 +275,19 @@ class _StatsScreenState extends State<StatsScreen> {
                 spacing: 6,
                 runSpacing: 6,
                 children: c.units.take(8).map((u) {
+                  // ✅ أيقونة حسب الدور
+                  final icon = u.isRanged
+                      ? Icons.gps_fixed_rounded
+                      : (u.isMelee
+                          ? Icons.gavel_rounded
+                          : Icons.shield_rounded);
+                  // ✅ لون حسب الفئة (O-M أحمر / O-R أخضر / D-M بنفسجي / D-R أزرق)
+                  final color = u.categoryColor;
                   return InfoChip(
-                    icon: u.info?.role == 'ranged'
-                        ? Icons.gps_fixed_rounded
-                        : Icons.gavel_rounded,
-                    label: '${S.unitName(u.displayName)} ${u.amount}',
-                    color: u.roleColor,
+                    icon: icon,
+                    label:
+                        '${S.unitName(u.displayName)} ${u.amount} · ${u.categoryShort}',
+                    color: color,
                   );
                 }).toList(),
               ),

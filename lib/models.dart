@@ -54,24 +54,65 @@ class UnitCatalogEntry {
     this.fightType,
   });
 
-  bool get isCombat => role == 'melee' || role == 'ranged';
-
-  bool get isDefensive {
-    final t = type ?? '';
-    return t.contains('Def') ||
-        t.contains('Militia') ||
-        t.contains('Peasant') ||
-        t.contains('Anti') ||
-        t.contains('Wall') ||
-        t.contains('Gate') ||
-        t.contains('Moat');
+  // ═══ المصدر ═══
+  /// barracks = هجوم | defense = دفاع | siege = حصار | wall/gate/moat = مباني
+  String get source {
+    final t = (type ?? '').toLowerCase();
+    if (t.contains('wall')) return 'wall';
+    if (t.contains('gate')) return 'gate';
+    if (t.contains('moat')) return 'moat';
+    if (t.contains('defense') || t.contains('defender')) return 'defense';
+    if (t.contains('siege') ||
+        t.contains('catapult') ||
+        t.contains('battering') ||
+        t.contains('mantlet')) return 'siege';
+    return 'barracks';
   }
 
+  bool get isWallType {
+    final s = source;
+    return s == 'wall' || s == 'gate' || s == 'moat';
+  }
+
+  // ═══ الدور ═══
+  bool get isMelee => role == 'melee';
+  bool get isRanged => role == 'ranged';
+
+  // ═══ التصنيف النهائي ═══
+  /// جندي قتالي حقيقي (مش مبنى دفاعي زي سور/بوابة/خندق)
+  bool get isCombat => (isMelee || isRanged) && !isWallType;
+
+  /// هجومي = قتالي ومش من ورشة الدفاع
+  bool get isOffensive => isCombat && source != 'defense';
+
+  /// دفاعي = قتالي ومن ورشة الدفاع
+  bool get isDefensive => isCombat && source == 'defense';
+
+  // ═══ UI ═══
+  /// بادج مختصر: O-M / O-R / D-M / D-R / SG / W / ?
+  String get categoryShort {
+    if (isWallType) return 'W';
+    if (source == 'siege') return 'SG';
+    if (isDefensive) return isRanged ? 'D-R' : 'D-M';
+    if (isOffensive) return isRanged ? 'O-R' : 'O-M';
+    return '?';
+  }
+
+  String get categoryLabel {
+    if (isWallType) return 'Wall / Gate / Moat';
+    if (source == 'siege') return 'Siege';
+    if (isDefensive) return isRanged ? 'Defense Ranged' : 'Defense Melee';
+    if (isOffensive) return isRanged ? 'Offense Ranged' : 'Offense Melee';
+    return 'Utility';
+  }
+
+  // ═══ backward compat ═══
   bool get isTrainable => isCombat;
 
   String get displayName {
     final t = (type ?? '').replaceFirst('Barracks_Unit_', '');
-    return t.isEmpty ? 'Unit #$wodId' : t;
+    if (t.isNotEmpty) return t;
+    return name ?? 'Unit #$wodId';
   }
 }
 
@@ -86,19 +127,43 @@ class CastleUnit {
   String get displayName => info?.displayName ?? 'Unit #$wodId';
 
   IconData get icon {
-    if (info?.role == 'ranged') return Icons.gps_fixed;
-    if (info?.role == 'melee') return Icons.gavel;
+    if (info?.isRanged == true) return Icons.gps_fixed;
+    if (info?.isMelee == true) return Icons.gavel;
     return Icons.shield;
   }
 
-  Color get roleColor {
-    if (info?.role == 'ranged') return const Color(0xFF06B6D4);
-    if (info?.role == 'melee') return const Color(0xFFEF4444);
+  // ═══ التصنيف ═══
+  bool get isOffensive => info?.isOffensive == true;
+  bool get isDefensive => info?.isDefensive == true;
+  bool get isMelee => info?.isMelee == true;
+  bool get isRanged => info?.isRanged == true;
+  bool get isCombat => info?.isCombat == true;
+  bool get isUnknown => info == null;
+
+  String get categoryShort => info?.categoryShort ?? '?';
+  String get categoryLabel => info?.categoryLabel ?? 'Unknown';
+
+  /// لون فريد لكل فئة
+  Color get categoryColor {
+    final i = info;
+    if (i == null) return const Color(0xFF90A4AE); // رمادي — مجهول
+    if (i.isWallType) return const Color(0xFF9E9E9E); // رمادي — جدار
+    if (i.isDefensive) {
+      return i.isRanged
+          ? const Color(0xFF3B82F6) // أزرق — دفاع رماح
+          : const Color(0xFF8B5CF6); // بنفسجي — دفاع اشتباك
+    }
+    if (i.isOffensive) {
+      return i.isRanged
+          ? const Color(0xFF10B981) // أخضر — هجوم رماح
+          : const Color(0xFFEF4444); // أحمر — هجوم اشتباك
+    }
+    if (i.source == 'siege') return const Color(0xFFF59E0B); // برتقالي
     return const Color(0xFF90A4AE);
   }
 
-  bool get isCombat => info?.isCombat == true;
-  bool get isDefensive => info?.isDefensive == true;
+  /// alias للـ backward compat
+  Color get roleColor => categoryColor;
 }
 
 // ═══════════════════════════════════════════
@@ -127,20 +192,15 @@ class Lord {
 class LordMovement {
   final int movementId;
   final int type;
-  final int totalTime; // TT — travel time
-  final int paidTime; // PT — travel time paid
+  final int totalTime;
+  final int paidTime;
   final int targetX;
   final int targetY;
   final int targetKid;
   final String? targetPlayerName;
   final String? targetAllianceName;
   final DateTime fetchedAt;
-
-  /// ⚠️ مدة الدعم الكلية في قلعة الحليف (TWD من UM)
-  /// null لو الحركة مش support أو مفيش بيانات support
   final int? stationTotalSeconds;
-
-  /// ⚠️ مدة الدعم المدفوعة لحد الآن (PWD من UM)
   final int? stationPaidSeconds;
 
   LordMovement({
@@ -158,7 +218,6 @@ class LordMovement {
     this.stationPaidSeconds,
   }) : fetchedAt = fetchedAt ?? DateTime.now();
 
-  // ─── حركة السفر ─────────────────────────────
   int get timeRemaining => totalTime - paidTime;
 
   int get liveRemainingSeconds {
@@ -168,8 +227,6 @@ class LordMovement {
 
   bool get isArrived => liveRemainingSeconds <= 0;
 
-  /// عدد الثواني المتبقية من الدعم في قلعة الحليف.
-  /// القيمة 0 لو الحركة مش stationed أو معلومات الدعم مش متوفرة.
   int get stationRemainingSeconds {
     if (stationTotalSeconds == null || stationPaidSeconds == null) return 0;
     final elapsed = DateTime.now().difference(fetchedAt).inSeconds;
@@ -177,20 +234,17 @@ class LordMovement {
         .clamp(0, 999999);
   }
 
-  /// الوقت المطلق اللي القائد هيرجع فيه من الدعم.
   DateTime? get stationReturnAt {
     if (stationTotalSeconds == null || stationPaidSeconds == null) return null;
     return fetchedAt
         .add(Duration(seconds: stationTotalSeconds! - stationPaidSeconds!));
   }
 
-  /// نوع support + وصل + لسه في الدعم
   bool get isStationed =>
       type == 1 && isArrived && stationRemainingSeconds > 0;
 
   bool get isReturning => type == 2;
 
-  /// حركة لسه "شغالة" فعلياً (تستحق العداد والتحديث)
   bool get isActive => !isArrived || isStationed;
 
   DateTime get startedAt => fetchedAt.subtract(Duration(seconds: paidTime));
@@ -206,8 +260,6 @@ class LordMovement {
   String? get stationReturnAtLabel =>
       stationReturnAt == null ? null : _fmt(stationReturnAt!);
 
-  /// العداد الحي — بيتحدث كل ثانية في الـ UI.
-  /// لو stationed → عدّاد الدعم، غير كده → عدّاد السفر.
   String get timeLabel {
     if (isStationed) {
       final s = stationRemainingSeconds;
@@ -256,11 +308,6 @@ class CommanderInfo {
 
   CommanderInfo({required this.lord, this.movement});
 
-  /// القائد "مشغول" فقط لو:
-  ///   • لسه بيسافر (مش وصل) ، أو
-  ///   • متمركز في قلعة حليف ووقت الدعم لسه ما خلصش
-  ///
-  /// بعد السفر + انتهاء الدعم → القائد متاح فوراً بدون refresh.
   bool get isBusy => movement != null && movement!.isActive;
 }
 
@@ -526,12 +573,16 @@ class AttackUnit {
   final int amount;
   final String position;
   final String? name;
+  final String? role;
+  final String? category;
 
   AttackUnit({
     required this.wodId,
     required this.amount,
     required this.position,
     this.name,
+    this.role,
+    this.category,
   });
 
   String get displayName => name ?? 'Unit #$wodId';
@@ -542,6 +593,20 @@ class AttackUnit {
         return Icons.castle_rounded;
       default:
         return Icons.shield_rounded;
+    }
+  }
+
+  /// بادج قصير لعرضه في كارت الهجوم
+  String get badge => category ?? '?';
+
+  Color get roleColor {
+    switch (role) {
+      case 'ranged':
+        return const Color(0xFF06B6D4);
+      case 'melee':
+        return const Color(0xFFEF4444);
+      default:
+        return const Color(0xFF90A4AE);
     }
   }
 }
@@ -660,7 +725,7 @@ class AttackAlert {
 
   String get shortSummary {
     final unitsPart = hasUnits ? ' · $totalUnits units' : '';
-    return '$attackerName → $liveRemainingLabel$unitsPart';
+    return '$attackerName → $liveRemainingLabel$unitsPart'; // ✅ تم إصلاح الـ typo
   }
 
   Map<String, int> get groupedUnits {
