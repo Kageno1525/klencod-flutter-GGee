@@ -1,1616 +1,197 @@
 import 'dart:async';
-import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-import 'package:gge/gge_client.dart';
-import 'package:gge/l10n/strings.dart';
-import 'package:gge/models.dart';
-import 'package:gge/theme.dart';
-import 'package:gge/widgets/animated_widgets.dart';
+import 'dart:convert';
+import '../gge_client.dart';
+import '../models.dart';
+import 'commanders_service.dart';
 
-class SmuggleScreen extends StatefulWidget {
-  final GgeClient client;
-  const SmuggleScreen({super.key, required this.client});
+class SmuggleService {
+  final GgeClient conn;
+  final CommandersService commanders;
+  SmuggleService(this.conn, this.commanders);
 
-  @override
-  State<SmuggleScreen> createState() => _SmuggleScreenState();
-}
+  Future<TransferResult> sendToAlly({
+    required OwnedCastle source,
+    required AllyCastle target,
+    required List<List<int>> units,
+    int stationTime = 12,
+    int? lordId,
+  }) async {
+    final filtered = <List<int>>[];
+    for (final u in units) {
+      if (u.length >= 2 && u[1] > 0) filtered.add([u[0], u[1]]);
+    }
+    if (filtered.isEmpty) return TransferResult.fail('No units selected');
 
-class _SmuggleScreenState extends State<SmuggleScreen> {
-  static const int kMaxUnitTypes = 10;
+    if (source.kingdomId != target.kingdomId) {
+      return TransferResult.fail(
+          'CROSS_KINGDOM: source KID=${source.kingdomId}, target KID=${target.kingdomId}');
+    }
 
-  List<OwnedCastle> _castles = [];
-  Map<int, UnitCatalogEntry> _catalog = {};
-  List<AllyMember> _members = [];
-  List<CommanderInfo> _commanders = [];
+    // ⚠️ حماية: السيرفر بيرفض > 10 أنواع (ban risk)
+    if (filtered.length > 10) {
+      return TransferResult.fail('TOO_MANY_UNIT_TYPES');
+    }
 
-  OwnedCastle? _source;
-  AllyMember? _target;
-  AllyCastle? _targetCastle;
-  Lord? _selectedLord;
+    // ✅ LID=0 = اللورد الرئيسي — يقدر يقود من أي قلعة في أي مملكة
+    int lid = lordId ?? 0;
+    if (lid < 0) lid = 0;
 
-  List<CastleUnit> _units = [];
-  final Map<int, TextEditingController> _amtCtrl = {};
-  final _timeCtrl = TextEditingController(text: '12');
+    TrafficLog.add(
+        'ST',
+        '[SMUGGLE] src KID=${source.kingdomId} areaId=${source.areaId} '
+        '(${source.x},${source.y}) → target (${target.x},${target.y}) '
+        'KID=${target.kingdomId} LID=$lid WT=$stationTime units=$filtered');
 
-  bool _loadingUnits = false;
-  bool _loadingMembers = false;
-  bool _loadingCommanders = false;
-  bool _sending = false;
-
-  int _hiddenUnitsCount = 0;
-  int _unknownUnitsCount = 0;
-
-  // ✅ فلتر الجنود: all | off | def | melee | ranged
-  String _unitFilter = 'all';
-
-  // ✅ فلتر الأعضاء: all | peace
-  String _memberFilter = 'all';
-
-  // ✅ ترتيب الأعضاء: default | closest | highest_peace
-  String _memberSort = 'default';
-
-  String? _error;
-
-  @override
-  void initState() {
-    super.initState();
-    _loadAll();
-  }
-
-  Future<void> _loadAll() async {
+    // ── 1. jca: switch to source kingdom ────────────────────────
     try {
-      final castles = await widget.client.getCastles();
-      final catalog = await widget.client.loadCatalog();
-      if (!mounted) return;
-      setState(() {
-        _castles = castles;
-        _catalog = catalog;
-        if (castles.isNotEmpty) {
-          _source = castles.firstWhere(
-            (c) => c.areaType == 1,
-            orElse: () => castles.first,
-          );
-        }
-      });
-      await _loadMembers();
-      await _loadCommanders();
+      TrafficLog.add('ST', '[JCA] → KID=${source.kingdomId}');
+      final jcaResp = await conn.sendXtAndWait(
+        'jca',
+        jsonEncode({'CID': -1, 'KID': source.kingdomId}),
+        responseCmd: 'jaa',
+        timeoutMs: 8000,
+      );
+      TrafficLog.add('ST', '[JCA-RESP] result=${jcaResp.resultCode}');
+
+      if (jcaResp.resultCode != 0) {
+        return TransferResult.fail(
+            'Kingdom switch failed (jca code ${jcaResp.resultCode})');
+      }
+      await Future.delayed(const Duration(milliseconds: 600));
     } catch (e) {
-      if (mounted) setState(() => _error = '$e');
+      TrafficLog.add('ER', '[JCA] failed: $e');
+      return TransferResult.fail('Kingdom switch failed: $e');
     }
-  }
 
-  Future<void> _loadCommanders() async {
-    setState(() => _loadingCommanders = true);
+    // ── 2. sdi: source & target coords (fire-and-forget) ────────
     try {
-      final cmds = await widget.client.getCommanders();
-      if (!mounted) return;
-      setState(() {
-        _commanders = cmds;
-        _loadingCommanders = false;
-
-        if (_selectedLord == null) {
-          final free = cmds.where((c) => !c.isBusy).toList();
-          if (free.isNotEmpty) {
-            try {
-              _selectedLord = free.firstWhere((c) => c.lord.id == 0).lord;
-            } catch (_) {
-              _selectedLord = free.first.lord;
-            }
-          }
-        } else {
-          final current = cmds.firstWhere(
-            (c) => c.lord.id == _selectedLord!.id,
-            orElse: () => CommanderInfo(lord: _selectedLord!),
-          );
-          if (current.isBusy) _selectedLord = null;
-        }
-      });
-    } catch (_) {
-      if (mounted) setState(() => _loadingCommanders = false);
-    }
-  }
-
-  Future<void> _loadMembers() async {
-    setState(() {
-      _loadingMembers = true;
-      _error = null;
-    });
-    try {
-      final members = await widget.client.getAllianceMembers();
-      if (!mounted) return;
-      setState(() {
-        _members = members;
-        _loadingMembers = false;
-      });
+      TrafficLog.add('ST',
+          '[SDI] SX=${source.x},SY=${source.y} → TX=${target.x},TY=${target.y}');
+      conn.sendXt(
+        'sdi',
+        jsonEncode({
+          'TX': target.x,
+          'TY': target.y,
+          'SX': source.x,
+          'SY': source.y,
+        }),
+      );
+      await Future.delayed(const Duration(milliseconds: 500));
     } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _loadingMembers = false;
-        if (e.toString().contains('not_in_alliance')) {
-          _error = S.notInAlliance;
-        } else {
-          _error = e.toString().replaceFirst('Exception: ', '');
-        }
-      });
+      TrafficLog.add('ER', '[SDI] failed: $e');
     }
-  }
 
-  /// ✅ ما نستبعدش حاجة بسبب الكتالوج الناقص.
-  ///   • لو info == null → نظهره كـ "Unknown" (بدل ما نخفيه).
-  ///   • نستبعد بس الجدران/البوابات/الخنادق (مباني مش جنود).
-  ///   • نقبل كل الجنود القتالية (offense + defense).
-  bool _isSendableForSmuggle(CastleUnit u) {
-    final info = u.info;
-    if (info == null) return true; // ✅ نعرضه بدل ما نخفيه
-    if (info.isWallType) return false; // ✅ سور/بوابة/خندق → استبعاد
-    return info.isCombat;
-  }
-
-  Future<void> _loadUnits() async {
-    if (_source == null) return;
-    setState(() {
-      _loadingUnits = true;
-      _units = [];
-      _hiddenUnitsCount = 0;
-      _unknownUnitsCount = 0;
-      for (final c in _amtCtrl.values) c.dispose();
-      _amtCtrl.clear();
-    });
+    // ── 3. cds: send troops ─────────────────────────────────────
     try {
-      final rawUnits = await widget.client
-          .getCastleUnits(_source!.kingdomId, _source!.areaId, _catalog);
-      if (!mounted) return;
+      TrafficLog.add('ST',
+          '[CDS] SID=${source.areaId} TX=${target.x},TY=${target.y} '
+          'LID=$lid WT=$stationTime A=$filtered');
 
-      final sendable = <CastleUnit>[];
-      int hidden = 0;
-      int unknown = 0;
-      for (final u in rawUnits) {
-        if (_isSendableForSmuggle(u)) {
-          sendable.add(u);
-          if (u.isUnknown) unknown++;
-        } else {
-          hidden++;
-        }
+      final resp = await conn.sendXtAndWait(
+        'cds',
+        jsonEncode({
+          'SID': source.areaId,
+          'TX': target.x,
+          'TY': target.y,
+          'LID': lid,
+          'WT': stationTime,
+          'HBW': -1,
+          'BPC': 0,
+          'PTT': 0,
+          'SD': 0,
+          'A': filtered,
+        }),
+        responseCmd: 'cds',
+        timeoutMs: 25000,
+        isAction: true,
+      );
+
+      TrafficLog.add('ST',
+          '[CDS-RESP] result=${resp.resultCode} (${_cdsErrorMessage(resp.resultCode)})');
+
+      if (resp.resultCode == 0) {
+        // ✅ استخرج MID من payload عشان نقدر نعمل recall بعدين
+        final mid = _extractMid(resp.payload);
+        TrafficLog.add('ST', '[CDS-OK] MID=$mid');
+        return TransferResult.ok(mid);
       }
 
-      // ✅ ترتيب: O-M → O-R → D-M → D-R → siege → unknown
-      sendable.sort((a, b) {
-        int rank(CastleUnit u) {
-          if (u.isUnknown) return 5;
-          final info = u.info;
-          if (info == null) return 5;
-          if (info.source == 'siege') return 4;
-          if (u.isOffensive && u.isMelee) return 0;
-          if (u.isOffensive && u.isRanged) return 1;
-          if (u.isDefensive && u.isMelee) return 2;
-          if (u.isDefensive && u.isRanged) return 3;
-          return 4;
-        }
-        return rank(a).compareTo(rank(b));
-      });
-
-      setState(() {
-        _units = sendable;
-        _hiddenUnitsCount = hidden;
-        _unknownUnitsCount = unknown;
-        for (final u in sendable) {
-          _amtCtrl[u.wodId] = TextEditingController(text: '0');
-        }
-        _loadingUnits = false;
-      });
-
-      if (sendable.isEmpty && hidden > 0) {
-        _snack(
-          S.isAr
-              ? 'كل الوحدات في ${_source!.displayName} دفاعية/أدوات ومش قابلة للإرسال'
-              : 'All units at ${_source!.displayName} are defensive / tools',
-          color: AppTheme.orange,
-        );
-      } else if (rawUnits.isEmpty) {
-        _snack(
-          S.isAr
-              ? 'لا توجد وحدات في ${_source!.displayName}'
-              : 'No units at ${_source!.displayName}',
-          color: AppTheme.orange,
-        );
+      if (resp.resultCode == 91) {
+        return TransferResult.fail('UNIT_NOT_SENDABLE_91');
       }
+
+      if (resp.resultCode == 218) {
+        return TransferResult.fail('LORD_BUSY_218');
+      }
+
+      if ([219, 222, 256, 404].contains(resp.resultCode) && lid != 0) {
+        return TransferResult.fail('LORD_UNAVAILABLE');
+      }
+
+      if (resp.resultCode == 219) {
+        return TransferResult.fail(
+            'Main Lord rejected (LID=0) — retry in a moment');
+      }
+
+      if (resp.resultCode == 181) {
+        return TransferResult.fail('Max kingdom army movements reached (181)');
+      }
+
+      if (resp.resultCode == 6) {
+        return TransferResult.fail(
+            'Error 6: commander not at source castle. Use Main Lord (LID=0)');
+      }
+
+      return TransferResult.fail(
+          'cds error ${resp.resultCode}: ${_cdsErrorMessage(resp.resultCode)}');
     } catch (e) {
-      if (!mounted) return;
-      setState(() => _loadingUnits = false);
-      _snack('$e', color: AppTheme.red);
+      TrafficLog.add('ER', '[CDS] exception: $e');
+      return TransferResult.fail('$e');
     }
   }
 
-  List<AllyMember> get _filteredMembers {
-    var list = _memberFilter == 'peace'
-        ? _members.where((m) => m.hasPeace).toList()
-        : List<AllyMember>.from(_members);
-
-    if (_memberSort == 'closest' && _source != null) {
-      list.sort((a, b) {
-        final da = a.closestDistance(_source!.kingdomId, _source!.x, _source!.y);
-        final db = b.closestDistance(_source!.kingdomId, _source!.x, _source!.y);
-        if (da == double.infinity && db == double.infinity) return 0;
-        if (da == double.infinity) return 1;
-        if (db == double.infinity) return -1;
-        return da.compareTo(db);
-      });
-    } else if (_memberSort == 'highest_peace') {
-      list.sort((a, b) => b.peaceTimeSeconds.compareTo(a.peaceTimeSeconds));
-    }
-
-    return list;
+  /// استخراج MID من cds response payload:
+  /// {"A":{"M":{"MID":353773379, ...}}, ...}
+  int? _extractMid(String? payload) {
+    if (payload == null || payload.isEmpty) return null;
+    try {
+      final data = jsonDecode(payload) as Map<String, dynamic>;
+      final a = data['A'] as Map?;
+      final m = a?['M'] as Map?;
+      final mid = m?['MID'];
+      if (mid is int) return mid;
+      if (mid is num) return mid.toInt();
+      if (mid is String) return int.tryParse(mid);
+    } catch (_) {}
+    return null;
   }
 
-  /// ✅ الفلترة الجديدة (5 خيارات)
-  List<CastleUnit> get _filteredUnits {
-    switch (_unitFilter) {
-      case 'off':
-        return _units.where((u) => u.isOffensive).toList();
-      case 'def':
-        return _units.where((u) => u.isDefensive).toList();
-      case 'melee':
-        return _units.where((u) => u.isMelee).toList();
-      case 'ranged':
-        return _units.where((u) => u.isRanged).toList();
+  String _cdsErrorMessage(int code) {
+    switch (code) {
+      case 0:
+        return 'OK';
+      case 6:
+        return 'Commander not available at source castle';
+      case 7:
+        return 'Target not in same kingdom';
+      case 13:
+        return 'Not enough troops';
+      case 91:
+        return 'Unit not sendable from this castle (Defensive)';
+      case 181:
+        return 'Max kingdom army movements reached';
+      case 218:
+        return 'Lord unavailable (busy)';
+      case 219:
+        return 'Invalid lord id';
+      case 222:
+        return 'Lord in movement';
+      case 256:
+        return 'Lord is used';
+      case 404:
+        return 'Lord needed';
       default:
-        return _units;
+        return 'Error $code';
     }
-  }
-
-  int get _selectedTypesCount {
-    int t = 0;
-    for (final u in _units) {
-      final a = int.tryParse(_amtCtrl[u.wodId]?.text ?? '0') ?? 0;
-      if (a > 0) t++;
-    }
-    return t;
-  }
-
-  int get _totalSelected {
-    int t = 0;
-    for (final u in _units) {
-      final a = int.tryParse(_amtCtrl[u.wodId]?.text ?? '0') ?? 0;
-      if (a > 0) t += a;
-    }
-    return t;
-  }
-
-  /// ✅ تحديد الكل = يحدد الجنود القتالية في الفلتر الحالي فقط
-  void _selectAllUnits() {
-    for (final c in _amtCtrl.values) c.text = '0';
-    final toSelect = _filteredUnits
-        .where((u) => u.isCombat) // يستبعد الـ unknown والجدران
-        .take(kMaxUnitTypes)
-        .toList();
-    for (final u in toSelect) {
-      _amtCtrl[u.wodId]?.text = u.amount.toString();
-    }
-    setState(() {});
-    if (toSelect.length < _filteredUnits.where((u) => u.amount > 0).length) {
-      _snack(
-        S.isAr
-            ? 'تم تحديد ${toSelect.length} نوع فقط (${kMaxUnitTypes} كحد أقصى)'
-            : 'Only ${toSelect.length} types selected (max $kMaxUnitTypes)',
-        color: AppTheme.orange,
-      );
-    }
-  }
-
-  void _clearAllUnits() {
-    for (final c in _amtCtrl.values) c.text = '0';
-    setState(() {});
-  }
-
-  Future<void> _send() async {
-    if (_source == null) return _snack('Select source', color: AppTheme.red);
-    if (_target == null || _targetCastle == null) {
-      return _snack('Select target', color: AppTheme.red);
-    }
-    if (_selectedLord == null) {
-      return _snack(S.allLordsBusy, color: AppTheme.red);
-    }
-    if (_targetCastle!.kingdomId != _source!.kingdomId) {
-      return _snack('مصدر وهدف في مملكتين مختلفتين', color: AppTheme.orange);
-    }
-
-    final toSend = <List<int>>[];
-    for (final u in _units) {
-      final a = int.tryParse(_amtCtrl[u.wodId]?.text ?? '0') ?? 0;
-      if (a > 0) toSend.add([u.wodId, a.clamp(0, u.amount)]);
-    }
-    if (toSend.isEmpty) return _snack(S.noUnitsSelected, color: AppTheme.orange);
-    if (toSend.length > kMaxUnitTypes) {
-      return _snack(
-          S.isAr
-              ? '🚫 لا يمكن إرسال أكثر من $kMaxUnitTypes أنواع في طلب واحد (${toSend.length})'
-              : '🚫 Cannot send more than $kMaxUnitTypes types (${toSend.length})',
-          color: AppTheme.red);
-    }
-
-    final stationTime = int.tryParse(_timeCtrl.text) ?? 12;
-    setState(() => _sending = true);
-
-    final result = await widget.client.sendToAlly(
-      source: _source!,
-      target: _targetCastle!,
-      units: toSend,
-      stationTime: stationTime,
-      lordId: _selectedLord!.id,
-    );
-    if (!mounted) return;
-    setState(() => _sending = false);
-
-    if (result.success) {
-      _snack('✓ ${S.transferOk}', color: AppTheme.green);
-      HapticFeedback.mediumImpact();
-      setState(() {
-        final sentMap = <int, int>{};
-        for (var item in toSend) sentMap[item[0]] = item[1];
-        for (int i = 0; i < _units.length; i++) {
-          if (sentMap.containsKey(_units[i].wodId)) {
-            _units[i] = CastleUnit(
-              wodId: _units[i].wodId,
-              amount: _units[i].amount - sentMap[_units[i].wodId]!,
-              info: _units[i].info,
-            );
-          }
-        }
-        _units.removeWhere((u) => u.amount <= 0);
-        _clearAllUnits();
-      });
-      _loadCommanders();
-    } else {
-      String errMsg = result.error ?? 'Unknown';
-      if (errMsg == 'ALL_LORDS_BUSY') {
-        errMsg = S.allLordsBusy;
-      } else if (errMsg == 'UNIT_NOT_SENDABLE_91') {
-        errMsg = 'وحدة مش قابلة للإرسال';
-      } else if (errMsg == 'LORD_BUSY_218') {
-        errMsg = 'اللورد مشغول';
-        _loadCommanders();
-      } else if (errMsg == 'LORD_UNAVAILABLE') {
-        errMsg = 'القائد غير متاح';
-      } else if (errMsg.contains('Max kingdom army movements')) {
-        errMsg = S.maxMovements;
-      }
-      _snack('${S.transferFail}: $errMsg', color: AppTheme.red);
-    }
-  }
-
-  void _snack(String msg, {Color? color}) {
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(
-        content:
-            Text(msg, style: const TextStyle(decoration: TextDecoration.none)),
-        backgroundColor: color,
-        behavior: SnackBarBehavior.floating,
-      ));
-  }
-
-  void _openLog() {
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.transparent,
-      builder: (_) => const _TrafficLogSheet(),
-    );
-  }
-
-  @override
-  void dispose() {
-    for (final c in _amtCtrl.values) c.dispose();
-    _timeCtrl.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      body: Stack(
-        children: [
-          AppTheme.background(context),
-          SafeArea(
-            child: Column(
-              children: [
-                _header(context),
-                Expanded(
-                  child: SingleChildScrollView(
-                    padding: const EdgeInsets.fromLTRB(16, 8, 16, 100),
-                    child: Column(
-                      children: [
-                        if (_error != null)
-                          _errorCard(context)
-                        else if (_loadingMembers)
-                          _loadingCard(context)
-                        else ...[
-                          FadeSlideIn(
-                              delay: const Duration(milliseconds: 100),
-                              child: _sourcePicker(context)),
-                          const SizedBox(height: 14),
-                          FadeSlideIn(
-                              delay: const Duration(milliseconds: 200),
-                              child: _membersSection(context)),
-                          if (_target != null && _targetCastle != null) ...[
-                            const SizedBox(height: 14),
-                            FadeSlideIn(
-                                delay: const Duration(milliseconds: 300),
-                                child: _lordPicker(context)),
-                            const SizedBox(height: 14),
-                            FadeSlideIn(
-                                delay: const Duration(milliseconds: 400),
-                                child: _timePicker(context)),
-                            const SizedBox(height: 14),
-                            FadeSlideIn(
-                                delay: const Duration(milliseconds: 500),
-                                child: _unitsSection(context)),
-                          ],
-                        ],
-                      ],
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          if (_targetCastle != null && _units.isNotEmpty)
-            Positioned(
-              left: 16,
-              right: 16,
-              bottom: 16,
-              child: FadeSlideIn(
-                delay: const Duration(milliseconds: 600),
-                offset: const Offset(0, 0.2),
-                child: GradientButton(
-                  label: '${S.send} ($_totalSelected)',
-                  icon: Icons.local_shipping_rounded,
-                  gradient: AppTheme.cosmosGradient,
-                  loading: _sending,
-                  onPressed: _send,
-                ),
-              ),
-            ),
-        ],
-      ),
-    );
-  }
-
-  Widget _header(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 14, 16, 4),
-      child: Row(
-        children: [
-          AppIconBtn(
-              icon: Icons.arrow_back_rounded,
-              onTap: () => Navigator.pop(context),
-              size: 42),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(S.smuggleTroops,
-                    style: TextStyle(
-                        fontSize: 20,
-                        fontWeight: FontWeight.w800,
-                        color: AppTheme.textColor(context),
-                        letterSpacing: -0.3,
-                        decoration: TextDecoration.none)),
-                Text(
-                    '${_filteredMembers.length} / ${_members.length} ${S.allianceMembers}',
-                    style: TextStyle(
-                        fontSize: 11,
-                        color: AppTheme.subTextColor(context),
-                        decoration: TextDecoration.none)),
-              ],
-            ),
-          ),
-          AppIconBtn(
-              icon: Icons.terminal_rounded,
-              onTap: _openLog,
-              color: AppTheme.orange,
-              size: 42),
-          const SizedBox(width: 8),
-          AppIconBtn(
-            icon: Icons.refresh_rounded,
-            onTap: _loadingMembers
-                ? null
-                : () async {
-                    await _loadMembers();
-                    await _loadCommanders();
-                  },
-            size: 42,
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _errorCard(BuildContext context) {
-    return AppTheme.glassCard(
-      context: context,
-      padding: const EdgeInsets.all(20),
-      child: Column(children: [
-        Container(
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-                color: AppTheme.red.withOpacity(0.12),
-                borderRadius: BorderRadius.circular(16),
-                border: Border.all(color: AppTheme.red.withOpacity(0.3))),
-            child: const Icon(Icons.error_outline_rounded,
-                color: AppTheme.red, size: 36)),
-        const SizedBox(height: 16),
-        Text(_error!,
-            textAlign: TextAlign.center,
-            style: TextStyle(
-                color: AppTheme.textColor(context),
-                fontSize: 13,
-                height: 1.5,
-                decoration: TextDecoration.none)),
-        const SizedBox(height: 16),
-        TextButton.icon(
-            onPressed: _loadMembers,
-            icon: const Icon(Icons.refresh_rounded,
-                color: AppTheme.purple, size: 16),
-            label: Text(S.retry,
-                style: const TextStyle(
-                    color: AppTheme.purple,
-                    fontWeight: FontWeight.bold,
-                    decoration: TextDecoration.none))),
-      ]),
-    );
-  }
-
-  Widget _loadingCard(BuildContext context) {
-    return AppTheme.glassCard(
-      context: context,
-      padding: const EdgeInsets.all(32),
-      child: Column(children: [
-        const CircularProgressIndicator(color: AppTheme.purple),
-        const SizedBox(height: 16),
-        Text(S.loadingMembers,
-            style: TextStyle(
-                color: AppTheme.subTextColor(context),
-                decoration: TextDecoration.none)),
-      ]),
-    );
-  }
-
-  Widget _sourcePicker(BuildContext context) {
-    return AppTheme.glassCard(
-      context: context,
-      padding: const EdgeInsets.all(14),
-      child: Row(children: [
-        Container(
-            width: 42,
-            height: 42,
-            decoration: BoxDecoration(
-                color: AppTheme.teal.withOpacity(0.15),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: AppTheme.teal.withOpacity(0.3))),
-            child:
-                const Icon(Icons.castle_rounded, color: AppTheme.teal, size: 20)),
-        const SizedBox(width: 12),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(S.from,
-                  style: TextStyle(
-                      fontSize: 10,
-                      fontWeight: FontWeight.bold,
-                      color: AppTheme.subTextColor(context),
-                      letterSpacing: 0.8,
-                      decoration: TextDecoration.none)),
-              const SizedBox(height: 2),
-              DropdownButtonHideUnderline(
-                child: DropdownButton<OwnedCastle>(
-                  value: _source,
-                  isExpanded: true,
-                  isDense: true,
-                  dropdownColor: Theme.of(context).colorScheme.surface,
-                  borderRadius: BorderRadius.circular(14),
-                  style: TextStyle(
-                      fontSize: 13,
-                      fontWeight: FontWeight.w600,
-                      color: AppTheme.textColor(context)),
-                  items: _castles
-                      .map((c) => DropdownMenuItem(
-                            value: c,
-                            child: Text(c.fullLabel,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                    color: AppTheme.textColor(context),
-                                    fontSize: 13)),
-                          ))
-                      .toList(),
-                  onChanged: (v) {
-                    setState(() {
-                      _source = v;
-                      _units = [];
-                      _hiddenUnitsCount = 0;
-                      _unknownUnitsCount = 0;
-                      for (final c in _amtCtrl.values) c.dispose();
-                      _amtCtrl.clear();
-                    });
-                    if (_target != null && v != null) {
-                      final newTargetCastle = _target!.castleIn(v.kingdomId);
-                      if (newTargetCastle != null) {
-                        setState(() => _targetCastle = newTargetCastle);
-                        _loadUnits();
-                      } else {
-                        setState(() {
-                          _target = null;
-                          _targetCastle = null;
-                        });
-                      }
-                    }
-                  },
-                ),
-              ),
-            ],
-          ),
-        ),
-      ]),
-    );
-  }
-
-  Widget _lordPicker(BuildContext context) {
-    final availableLords =
-        _commanders.where((c) => !c.isBusy).map((c) => c.lord).toList();
-    if (_selectedLord != null &&
-        !availableLords.any((l) => l.id == _selectedLord!.id)) {
-      _selectedLord = null;
-    }
-    if (_selectedLord == null && availableLords.isNotEmpty) {
-      try {
-        _selectedLord = availableLords.firstWhere((l) => l.id == 0);
-      } catch (_) {
-        _selectedLord = availableLords.first;
-      }
-    }
-
-    return AppTheme.glassCard(
-      context: context,
-      padding: const EdgeInsets.all(14),
-      child: _loadingCommanders
-          ? const Center(
-              child: SizedBox(
-                  width: 20,
-                  height: 20,
-                  child: CircularProgressIndicator(
-                      strokeWidth: 2, color: AppTheme.purple)))
-          : Row(children: [
-              Container(
-                  width: 42,
-                  height: 42,
-                  decoration: BoxDecoration(
-                      color: AppTheme.orange.withOpacity(0.15),
-                      borderRadius: BorderRadius.circular(12),
-                      border: Border.all(
-                          color: AppTheme.orange.withOpacity(0.3))),
-                  child: const Icon(Icons.person_rounded,
-                      color: AppTheme.orange, size: 20)),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(S.selectLord,
-                        style: TextStyle(
-                            fontSize: 10,
-                            fontWeight: FontWeight.bold,
-                            color: AppTheme.subTextColor(context),
-                            letterSpacing: 0.8,
-                            decoration: TextDecoration.none)),
-                    const SizedBox(height: 2),
-                    DropdownButtonHideUnderline(
-                      child: DropdownButton<Lord>(
-                        value: _selectedLord,
-                        isExpanded: true,
-                        isDense: true,
-                        dropdownColor: Theme.of(context).colorScheme.surface,
-                        borderRadius: BorderRadius.circular(14),
-                        style: TextStyle(
-                            fontSize: 13,
-                            fontWeight: FontWeight.w600,
-                            color: AppTheme.textColor(context)),
-                        items: availableLords
-                            .map((l) => DropdownMenuItem(
-                                  value: l,
-                                  child: Text(
-                                      l.id == 0
-                                          ? (S.isAr
-                                              ? 'اللورد الرئيسي'
-                                              : 'Main Lord')
-                                          : l.displayName,
-                                      style: TextStyle(
-                                          fontSize: 13,
-                                          color: AppTheme.textColor(context))),
-                                ))
-                            .toList(),
-                        onChanged: (v) => setState(() => _selectedLord = v),
-                      ),
-                    ),
-                    if (availableLords.isEmpty)
-                      Padding(
-                        padding: const EdgeInsets.only(top: 4),
-                        child: Text(S.allLordsBusy,
-                            style: TextStyle(
-                                color: AppTheme.orange,
-                                fontSize: 10,
-                                decoration: TextDecoration.none)),
-                      ),
-                  ],
-                ),
-              ),
-            ]),
-    );
-  }
-
-  Widget _timePicker(BuildContext context) {
-    return AppTheme.glassCard(
-      context: context,
-      padding: const EdgeInsets.all(14),
-      child: Row(children: [
-        Container(
-            width: 42,
-            height: 42,
-            decoration: BoxDecoration(
-                color: AppTheme.blue.withOpacity(0.15),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: AppTheme.blue.withOpacity(0.3))),
-            child:
-                const Icon(Icons.timer_rounded, color: AppTheme.blue, size: 20)),
-        const SizedBox(width: 12),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(S.stationTime,
-                  style: TextStyle(
-                      fontSize: 10,
-                      fontWeight: FontWeight.bold,
-                      color: AppTheme.subTextColor(context),
-                      letterSpacing: 0.8,
-                      decoration: TextDecoration.none)),
-              const SizedBox(height: 2),
-              TextField(
-                controller: _timeCtrl,
-                keyboardType: TextInputType.number,
-                inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                style: TextStyle(
-                    color: AppTheme.textColor(context),
-                    fontSize: 16,
-                    fontWeight: FontWeight.bold,
-                    decoration: TextDecoration.none),
-                decoration: const InputDecoration(
-                    isDense: true,
-                    contentPadding: EdgeInsets.symmetric(vertical: 6),
-                    border: InputBorder.none,
-                    enabledBorder: InputBorder.none,
-                    focusedBorder: InputBorder.none),
-              ),
-            ],
-          ),
-        ),
-      ]),
-    );
-  }
-
-  Widget _membersSection(BuildContext context) {
-    final filtered = _filteredMembers;
-    return AppTheme.glassCard(
-      context: context,
-      padding: const EdgeInsets.all(14),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(children: [
-            Container(
-                width: 32,
-                height: 32,
-                decoration: BoxDecoration(
-                    color: AppTheme.purple.withOpacity(0.15),
-                    borderRadius: BorderRadius.circular(10)),
-                child: const Icon(Icons.group_rounded,
-                    color: AppTheme.purple, size: 18)),
-            const SizedBox(width: 10),
-            Expanded(
-                child: Text(S.allianceMembers,
-                    style: TextStyle(
-                        color: AppTheme.textColor(context),
-                        fontWeight: FontWeight.bold,
-                        fontSize: 14,
-                        decoration: TextDecoration.none))),
-            _memberChip(context, 'all', S.allMembers),
-            const SizedBox(width: 6),
-            _memberChip(context, 'peace', S.peaceOnly),
-            const SizedBox(width: 4),
-            _memberSortButton(context),
-          ]),
-          const SizedBox(height: 12),
-          if (filtered.isEmpty)
-            Padding(
-                padding: const EdgeInsets.all(20),
-                child: Center(
-                    child: Text(
-                        _memberFilter == 'peace'
-                            ? (S.isAr
-                                ? 'مفيش أعضاء عليهم حماية حالياً'
-                                : 'No members with peace shield')
-                            : S.noAllianceMembers,
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                            color: AppTheme.subTextColor(context),
-                            decoration: TextDecoration.none))))
-          else
-            ...filtered.map((m) => _memberTile(context, m)),
-        ],
-      ),
-    );
-  }
-
-  Widget _memberChip(BuildContext context, String key, String label) {
-    final sel = _memberFilter == key;
-    return GestureDetector(
-      onTap: () => setState(() => _memberFilter = key),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-        decoration: BoxDecoration(
-          gradient: sel ? AppTheme.primaryGradient : null,
-          color: sel
-              ? null
-              : Theme.of(context).colorScheme.surface.withOpacity(0.6),
-          borderRadius: BorderRadius.circular(10),
-          border: sel
-              ? null
-              : Border.all(
-                  color: AppTheme.subTextColor(context).withOpacity(0.1)),
-        ),
-        child: Text(label,
-            style: TextStyle(
-                color: sel ? Colors.white : AppTheme.subTextColor(context),
-                fontSize: 10,
-                fontWeight: sel ? FontWeight.bold : FontWeight.w500,
-                decoration: TextDecoration.none)),
-      ),
-    );
-  }
-
-  Widget _memberSortButton(BuildContext context) {
-    final active = _memberSort != 'default';
-    final icon = switch (_memberSort) {
-      'closest' => Icons.near_me_rounded,
-      'highest_peace' => Icons.shield_rounded,
-      _ => Icons.sort_rounded,
-    };
-
-    return PopupMenuButton<String>(
-      onSelected: (v) => setState(() => _memberSort = v),
-      itemBuilder: (_) => [
-        _sortItem(context, 'default',
-            S.isAr ? 'بدون ترتيب' : 'Default order'),
-        _sortItem(context, 'closest',
-            S.isAr ? 'الأقرب للمصدر' : 'Closest to source'),
-        _sortItem(context, 'highest_peace',
-            S.isAr ? 'أعلى أيام حماية' : 'Highest peace days'),
-      ],
-      child: Container(
-        padding: const EdgeInsets.all(6),
-        decoration: BoxDecoration(
-          color: active
-              ? AppTheme.teal.withOpacity(0.2)
-              : Theme.of(context).colorScheme.surface.withOpacity(0.6),
-          borderRadius: BorderRadius.circular(10),
-          border: Border.all(
-              color: active
-                  ? AppTheme.teal.withOpacity(0.4)
-                  : AppTheme.subTextColor(context).withOpacity(0.1)),
-        ),
-        child: Icon(icon,
-            size: 16,
-            color: active ? AppTheme.teal : AppTheme.subTextColor(context)),
-      ),
-    );
-  }
-
-  PopupMenuItem<String> _sortItem(
-      BuildContext context, String value, String label) {
-    final sel = _memberSort == value;
-    return PopupMenuItem(
-      value: value,
-      child: Row(children: [
-        Icon(sel ? Icons.check_rounded : Icons.radio_button_unchecked,
-            size: 16,
-            color: sel ? AppTheme.green : AppTheme.subTextColor(context)),
-        const SizedBox(width: 8),
-        Text(label,
-            style: TextStyle(
-                color: AppTheme.textColor(context),
-                fontSize: 13,
-                decoration: TextDecoration.none)),
-      ]),
-    );
-  }
-
-  Widget _memberTile(BuildContext context, AllyMember m) {
-    final selected = _target?.playerId == m.playerId;
-    final hasPeace = m.hasPeace;
-
-    String distanceLabel = '';
-    if (_source != null) {
-      final d = m.closestDistance(_source!.kingdomId, _source!.x, _source!.y);
-      distanceLabel = d == double.infinity
-          ? (S.isAr ? 'مملكة أخرى' : 'Diff. kingdom')
-          : '${d.toStringAsFixed(0)} ${S.clicks}';
-    }
-
-    return GestureDetector(
-      onTap: () {
-        if (_source == null) {
-          _snack(S.isAr ? 'اختر مصدر أولاً' : 'Select source first',
-              color: AppTheme.orange);
-          return;
-        }
-        final sameKingdom = m.castleIn(_source!.kingdomId);
-        if (sameKingdom == null) {
-          _snack(
-              S.isAr
-                  ? '${m.name} ليس لديه قلعة في مملكتك'
-                  : '${m.name} has no castle in your kingdom',
-              color: AppTheme.orange);
-          return;
-        }
-        setState(() {
-          _target = m;
-          _targetCastle = sameKingdom;
-          _units = [];
-          _hiddenUnitsCount = 0;
-          _unknownUnitsCount = 0;
-          for (final c in _amtCtrl.values) c.dispose();
-          _amtCtrl.clear();
-        });
-        _loadUnits();
-      },
-      child: Container(
-        margin: const EdgeInsets.only(bottom: 8),
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(
-          gradient: selected ? AppTheme.primaryGradient : null,
-          color: selected
-              ? null
-              : (AppTheme.isDark(context)
-                  ? Colors.white.withOpacity(0.03)
-                  : Colors.black.withOpacity(0.02)),
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(
-              color: selected
-                  ? Colors.transparent
-                  : (hasPeace
-                      ? AppTheme.green.withOpacity(0.3)
-                      : AppTheme.subTextColor(context).withOpacity(0.1)),
-              width: 1.2),
-        ),
-        child: Row(children: [
-          Container(
-              width: 42,
-              height: 42,
-              decoration: BoxDecoration(
-                  color: hasPeace
-                      ? (selected
-                          ? Colors.white.withOpacity(0.22)
-                          : AppTheme.green.withOpacity(0.18))
-                      : (selected
-                          ? Colors.white.withOpacity(0.12)
-                          : AppTheme.subTextColor(context).withOpacity(0.08)),
-                  borderRadius: BorderRadius.circular(12)),
-              child: Icon(
-                  hasPeace ? Icons.shield_moon_rounded : Icons.shield_outlined,
-                  color: selected
-                      ? Colors.white
-                      : (hasPeace
-                          ? AppTheme.green
-                          : AppTheme.subTextColor(context)),
-                  size: 22)),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(children: [
-                  Flexible(
-                      child: Text(m.name,
-                          style: TextStyle(
-                              color: selected
-                                  ? Colors.white
-                                  : AppTheme.textColor(context),
-                              fontWeight: FontWeight.bold,
-                              fontSize: 13.5,
-                              decoration: TextDecoration.none),
-                          overflow: TextOverflow.ellipsis)),
-                  const SizedBox(width: 6),
-                  Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 6, vertical: 2),
-                      decoration: BoxDecoration(
-                          color: selected
-                              ? Colors.white.withOpacity(0.2)
-                              : AppTheme.subTextColor(context).withOpacity(0.1),
-                          borderRadius: BorderRadius.circular(6)),
-                      child: Text('Lv ${m.level}',
-                          style: TextStyle(
-                              color: selected
-                                  ? Colors.white
-                                  : AppTheme.subTextColor(context),
-                              fontSize: 9,
-                              fontWeight: FontWeight.bold,
-                              decoration: TextDecoration.none))),
-                ]),
-                const SizedBox(height: 3),
-                Row(children: [
-                  if (hasPeace) ...[
-                    Icon(Icons.verified_user_rounded,
-                        size: 11,
-                        color: selected ? Colors.white : AppTheme.green),
-                    const SizedBox(width: 3),
-                    Text('${S.peaceActive} · ${m.peaceLabel}',
-                        style: TextStyle(
-                            color: selected ? Colors.white : AppTheme.green,
-                            fontSize: 10,
-                            fontWeight: FontWeight.w600,
-                            decoration: TextDecoration.none)),
-                  ] else
-                    Text(S.noPeaceActive,
-                        style: TextStyle(
-                            color: selected
-                                ? Colors.white70
-                                : AppTheme.subTextColor(context),
-                            fontSize: 10,
-                            decoration: TextDecoration.none)),
-                  const SizedBox(width: 10),
-                  if (distanceLabel.isNotEmpty) ...[
-                    Icon(Icons.place_rounded,
-                        size: 11,
-                        color: selected
-                            ? Colors.white70
-                            : AppTheme.subTextColor(context)),
-                    const SizedBox(width: 3),
-                    Text(distanceLabel,
-                        style: TextStyle(
-                            color: selected
-                                ? Colors.white70
-                                : AppTheme.subTextColor(context),
-                            fontSize: 10,
-                            decoration: TextDecoration.none)),
-                  ],
-                ]),
-              ],
-            ),
-          ),
-          if (selected)
-            const Icon(Icons.check_circle_rounded,
-                color: Colors.white, size: 22),
-        ]),
-      ),
-    );
-  }
-
-  Widget _unitsSection(BuildContext context) {
-    if (_loadingUnits) {
-      return AppTheme.glassCard(
-        context: context,
-        padding: const EdgeInsets.all(24),
-        child: const Center(
-            child: CircularProgressIndicator(color: AppTheme.purple)),
-      );
-    }
-    final typesCount = _selectedTypesCount;
-    final atLimit = typesCount >= kMaxUnitTypes;
-
-    return AppTheme.glassCard(
-      context: context,
-      padding: const EdgeInsets.all(14),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(children: [
-            Container(
-                width: 32,
-                height: 32,
-                decoration: BoxDecoration(
-                    color: AppTheme.teal.withOpacity(0.15),
-                    borderRadius: BorderRadius.circular(10)),
-                child: const Icon(Icons.groups_rounded,
-                    color: AppTheme.teal, size: 18)),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text('${S.sendTo} ${_target?.name ?? ""}',
-                      style: TextStyle(
-                          color: AppTheme.textColor(context),
-                          fontWeight: FontWeight.bold,
-                          fontSize: 13.5,
-                          decoration: TextDecoration.none),
-                      overflow: TextOverflow.ellipsis),
-                  Text('→ ${_targetCastle!.displayLabel}',
-                      style: TextStyle(
-                          color: AppTheme.subTextColor(context),
-                          fontSize: 10.5,
-                          decoration: TextDecoration.none)),
-                ],
-              ),
-            ),
-            Container(
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-              decoration: BoxDecoration(
-                color: atLimit
-                    ? AppTheme.orange.withOpacity(0.15)
-                    : AppTheme.teal.withOpacity(0.12),
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(
-                    color: atLimit
-                        ? AppTheme.orange.withOpacity(0.4)
-                        : AppTheme.teal.withOpacity(0.3)),
-              ),
-              child: Text('$typesCount / $kMaxUnitTypes',
-                  style: TextStyle(
-                      color: atLimit ? AppTheme.orange : AppTheme.teal,
-                      fontWeight: FontWeight.bold,
-                      fontSize: 11,
-                      decoration: TextDecoration.none)),
-            ),
-          ]),
-          const SizedBox(height: 12),
-
-          // ✅ بانرات التحذير
-          if (_hiddenUnitsCount > 0)
-            Padding(
-              padding: const EdgeInsets.only(bottom: 8),
-              child: Container(
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                    color: AppTheme.orange.withOpacity(0.1),
-                    borderRadius: BorderRadius.circular(10),
-                    border:
-                        Border.all(color: AppTheme.orange.withOpacity(0.3))),
-                child: Row(children: [
-                  const Icon(Icons.info_outline_rounded,
-                      color: AppTheme.orange, size: 16),
-                  const SizedBox(width: 8),
-                  Expanded(
-                      child: Text(
-                          S.isAr
-                              ? '$_hiddenUnitsCount نوع (أدوات/جدران) مخفي — غير قابل للإرسال'
-                              : '$_hiddenUnitsCount unit type(s) hidden (tools/walls)',
-                          style: const TextStyle(
-                              color: AppTheme.orange,
-                              fontSize: 10.5,
-                              decoration: TextDecoration.none))),
-                ]),
-              ),
-            ),
-          if (_unknownUnitsCount > 0)
-            Padding(
-              padding: const EdgeInsets.only(bottom: 8),
-              child: Container(
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                    color: AppTheme.blue.withOpacity(0.1),
-                    borderRadius: BorderRadius.circular(10),
-                    border:
-                        Border.all(color: AppTheme.blue.withOpacity(0.3))),
-                child: Row(children: [
-                  const Icon(Icons.help_outline_rounded,
-                      color: AppTheme.blue, size: 16),
-                  const SizedBox(width: 8),
-                  Expanded(
-                      child: Text(
-                          S.isAr
-                              ? '$_unknownUnitsCount جندي مش موجود في الكتالوج — لو بعتهم ممكن يرفض'
-                              : '$_unknownUnitsCount unit(s) not in catalog — may fail to send',
-                          style: const TextStyle(
-                              color: AppTheme.blue,
-                              fontSize: 10.5,
-                              decoration: TextDecoration.none))),
-                ]),
-              ),
-            ),
-
-          // ✅ فلتر 5 خيارات
-          Wrap(
-            spacing: 6,
-            runSpacing: 6,
-            children: [
-              _unitChip(context, 'all', S.allUnits),
-              _unitChip(context, 'off', S.isAr ? 'هجوم' : 'Offense'),
-              _unitChip(context, 'def', S.isAr ? 'دفاع' : 'Defense'),
-              _unitChip(context, 'melee', S.isAr ? 'اشتباك' : 'Melee'),
-              _unitChip(context, 'ranged', S.isAr ? 'رماح' : 'Ranged'),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Row(children: [
-            const Spacer(),
-            InkWell(
-              onTap: _selectAllUnits,
-              borderRadius: BorderRadius.circular(8),
-              child: Container(
-                  padding: const EdgeInsets.all(6),
-                  decoration: BoxDecoration(
-                      color: AppTheme.teal.withOpacity(0.15),
-                      borderRadius: BorderRadius.circular(8)),
-                  child: const Icon(Icons.done_all_rounded,
-                      color: AppTheme.teal, size: 16)),
-            ),
-            const SizedBox(width: 6),
-            InkWell(
-              onTap: _clearAllUnits,
-              borderRadius: BorderRadius.circular(8),
-              child: Container(
-                  padding: const EdgeInsets.all(6),
-                  decoration: BoxDecoration(
-                      color: AppTheme.subTextColor(context).withOpacity(0.08),
-                      borderRadius: BorderRadius.circular(8)),
-                  child: Icon(Icons.clear_all_rounded,
-                      color: AppTheme.subTextColor(context), size: 16)),
-            ),
-          ]),
-          const SizedBox(height: 10),
-          if (_filteredUnits.isEmpty)
-            Padding(
-              padding: const EdgeInsets.all(20),
-              child: Center(
-                  child: Text(
-                      S.isAr
-                          ? 'لا توجد وحدات قابلة للإرسال'
-                          : 'No sendable units',
-                      style: TextStyle(
-                          color: AppTheme.subTextColor(context),
-                          decoration: TextDecoration.none))),
-            )
-          else
-            ..._filteredUnits.map((u) => _unitRow(context, u)),
-          const SizedBox(height: 10),
-          Container(
-            padding: const EdgeInsets.all(14),
-            decoration: BoxDecoration(
-                gradient: AppTheme.primaryGradient,
-                borderRadius: BorderRadius.circular(14),
-                boxShadow: [
-                  BoxShadow(
-                      color: AppTheme.purple.withOpacity(0.3),
-                      blurRadius: 18,
-                      offset: const Offset(0, 8))
-                ]),
-            child: Row(children: [
-              const Icon(Icons.calculate_rounded,
-                  color: Colors.white, size: 20),
-              const SizedBox(width: 10),
-              Text(S.total,
-                  style: const TextStyle(
-                      color: Colors.white,
-                      fontWeight: FontWeight.bold,
-                      fontSize: 13,
-                      decoration: TextDecoration.none)),
-              const Spacer(),
-              Text('$_totalSelected',
-                  style: const TextStyle(
-                      color: Colors.white,
-                      fontWeight: FontWeight.w900,
-                      fontSize: 22,
-                      decoration: TextDecoration.none)),
-            ]),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _unitChip(BuildContext context, String key, String label) {
-    final sel = _unitFilter == key;
-    return GestureDetector(
-      onTap: () => setState(() => _unitFilter = key),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-        decoration: BoxDecoration(
-          gradient: sel ? AppTheme.secondaryGradient : null,
-          color: sel
-              ? null
-              : Theme.of(context).colorScheme.surface.withOpacity(0.6),
-          borderRadius: BorderRadius.circular(10),
-          border: sel
-              ? null
-              : Border.all(
-                  color: AppTheme.subTextColor(context).withOpacity(0.1)),
-        ),
-        child: Text(label,
-            style: TextStyle(
-                color: sel ? Colors.white : AppTheme.subTextColor(context),
-                fontSize: 10.5,
-                fontWeight: sel ? FontWeight.bold : FontWeight.w500,
-                decoration: TextDecoration.none)),
-      ),
-    );
-  }
-
-  Widget _unitRow(BuildContext context, CastleUnit u) {
-    final catColor = u.categoryColor;
-    return Container(
-      margin: const EdgeInsets.only(bottom: 8),
-      padding: const EdgeInsets.all(10),
-      decoration: BoxDecoration(
-        color: Theme.of(context)
-            .colorScheme
-            .surface
-            .withOpacity(AppTheme.isDark(context) ? 0.5 : 0.85),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: catColor.withOpacity(0.35)),
-      ),
-      child: Row(children: [
-        Container(
-            width: 38,
-            height: 38,
-            decoration: BoxDecoration(
-                color: catColor.withOpacity(0.18),
-                borderRadius: BorderRadius.circular(10),
-                border: Border.all(color: catColor.withOpacity(0.4))),
-            child: Icon(u.icon, color: catColor, size: 20)),
-        const SizedBox(width: 10),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(children: [
-                Flexible(
-                  child: Text(S.unitName(u.displayName),
-                      style: TextStyle(
-                          color: AppTheme.textColor(context),
-                          fontWeight: FontWeight.bold,
-                          fontSize: 12,
-                          decoration: TextDecoration.none),
-                      overflow: TextOverflow.ellipsis),
-                ),
-                const SizedBox(width: 6),
-                // ✅ البادج: O-M / O-R / D-M / D-R / SG / W / ?
-                Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
-                  decoration: BoxDecoration(
-                    color: catColor.withOpacity(0.18),
-                    borderRadius: BorderRadius.circular(5),
-                    border: Border.all(color: catColor.withOpacity(0.5)),
-                  ),
-                  child: Text(u.categoryShort,
-                      style: TextStyle(
-                          color: catColor,
-                          fontSize: 9,
-                          fontWeight: FontWeight.w900,
-                          letterSpacing: 0.3,
-                          decoration: TextDecoration.none)),
-                ),
-              ]),
-              Text('${S.available}: ${u.amount}  ·  ${u.categoryLabel}',
-                  style: TextStyle(
-                      color: AppTheme.subTextColor(context),
-                      fontSize: 10,
-                      decoration: TextDecoration.none)),
-            ],
-          ),
-        ),
-        SizedBox(
-            width: 70,
-            height: 36,
-            child: TextField(
-              controller: _amtCtrl[u.wodId],
-              keyboardType: TextInputType.number,
-              inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-              textAlign: TextAlign.center,
-              style: TextStyle(
-                  color: AppTheme.textColor(context),
-                  fontSize: 13,
-                  fontWeight: FontWeight.bold,
-                  decoration: TextDecoration.none),
-              decoration: InputDecoration(
-                contentPadding: const EdgeInsets.symmetric(vertical: 6),
-                hintText: '0',
-                enabledBorder: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(8),
-                    borderSide: BorderSide(
-                        color:
-                            AppTheme.subTextColor(context).withOpacity(0.1))),
-              ),
-              onChanged: (_) => setState(() {}),
-            )),
-        const SizedBox(width: 4),
-        InkWell(
-          onTap: () {
-            _amtCtrl[u.wodId]?.text = u.amount.toString();
-            setState(() {});
-          },
-          borderRadius: BorderRadius.circular(8),
-          child: Container(
-              width: 32,
-              height: 32,
-              decoration: BoxDecoration(
-                  color: AppTheme.teal.withOpacity(0.18),
-                  borderRadius: BorderRadius.circular(8)),
-              child: const Icon(Icons.keyboard_double_arrow_up_rounded,
-                  color: AppTheme.teal, size: 16)),
-        ),
-      ]),
-    );
-  }
-}
-
-class _TrafficLogSheet extends StatefulWidget {
-  const _TrafficLogSheet();
-  @override
-  State<_TrafficLogSheet> createState() => _TrafficLogSheetState();
-}
-
-class _TrafficLogSheetState extends State<_TrafficLogSheet> {
-  final ScrollController _scroll = ScrollController();
-  StreamSubscription? _sub;
-  bool _autoScroll = true;
-
-  @override
-  void initState() {
-    super.initState();
-    _sub = TrafficLog.stream.listen((_) {
-      if (!mounted) return;
-      setState(() {});
-      if (_autoScroll) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (_scroll.hasClients) {
-            _scroll.jumpTo(_scroll.position.maxScrollExtent);
-          }
-        });
-      }
-    });
-  }
-
-  @override
-  void dispose() {
-    _sub?.cancel();
-    _scroll.dispose();
-    super.dispose();
-  }
-
-  Future<void> _copyAll() async {
-    await Clipboard.setData(ClipboardData(text: TrafficLog.dump()));
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Text('Copied ${TrafficLog.entries.length} entries ✓',
-          style: const TextStyle(decoration: TextDecoration.none)),
-      duration: const Duration(seconds: 2),
-      behavior: SnackBarBehavior.floating,
-      backgroundColor: AppTheme.green,
-    ));
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final entries = TrafficLog.entries;
-    final h = MediaQuery.of(context).size.height;
-    return Container(
-      height: h * 0.9,
-      decoration: const BoxDecoration(
-          color: Color(0xFF0B0B14),
-          borderRadius: BorderRadius.vertical(top: Radius.circular(24))),
-      child: SafeArea(
-        top: false,
-        child: Column(children: [
-          Container(
-              width: 44,
-              height: 5,
-              margin: const EdgeInsets.symmetric(vertical: 10),
-              decoration: BoxDecoration(
-                  color: Colors.white.withOpacity(0.2),
-                  borderRadius: BorderRadius.circular(3))),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12),
-            child: Row(children: [
-              Container(
-                  padding: const EdgeInsets.all(8),
-                  decoration: BoxDecoration(
-                      gradient: AppTheme.orangeGradient,
-                      borderRadius: BorderRadius.circular(10)),
-                  child: const Icon(Icons.terminal_rounded,
-                      color: Colors.white, size: 18)),
-              const SizedBox(width: 10),
-              Expanded(
-                  child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text('Traffic Log',
-                      style: TextStyle(
-                          color: Colors.white,
-                          fontWeight: FontWeight.bold,
-                          fontSize: 15,
-                          decoration: TextDecoration.none)),
-                  Text('${entries.length} entries',
-                      style: TextStyle(
-                          color: Colors.white.withOpacity(0.5),
-                          fontSize: 11,
-                          decoration: TextDecoration.none)),
-                ],
-              )),
-              IconButton(
-                  icon: const Icon(Icons.close_rounded, color: Colors.white),
-                  onPressed: () => Navigator.pop(context)),
-            ]),
-          ),
-          const SizedBox(height: 12),
-          Expanded(
-            child: Container(
-              margin: const EdgeInsets.symmetric(horizontal: 12),
-              padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(
-                  color: Colors.black,
-                  borderRadius: BorderRadius.circular(14),
-                  border: Border.all(color: Colors.white.withOpacity(0.08))),
-              child: entries.isEmpty
-                  ? const Center(
-                      child: Text('No traffic yet.',
-                          style: TextStyle(
-                              color: Colors.grey,
-                              fontFamily: 'monospace',
-                              fontSize: 11,
-                              decoration: TextDecoration.none)))
-                  : ListView.builder(
-                      controller: _scroll,
-                      itemCount: entries.length,
-                      itemBuilder: (_, i) {
-                        final line = entries[i];
-                        Color color = AppTheme.green;
-                        if (line.contains('[RX]')) {
-                          color = AppTheme.blue;
-                        } else if (line.contains('[ST]')) {
-                          color = AppTheme.teal;
-                        } else if (line.contains('[ER]')) {
-                          color = AppTheme.red;
-                        }
-                        return Padding(
-                          padding: const EdgeInsets.symmetric(vertical: 1),
-                          child: SelectableText(line,
-                              style: TextStyle(
-                                  color: color,
-                                  fontFamily: 'monospace',
-                                  fontSize: 10,
-                                  height: 1.4,
-                                  decoration: TextDecoration.none)),
-                        );
-                      },
-                    ),
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.all(12),
-            child: SizedBox(
-              width: double.infinity,
-              height: 48,
-              child: ElevatedButton.icon(
-                onPressed: _copyAll,
-                icon: const Icon(Icons.content_copy_rounded, size: 18),
-                label: Text('Copy All (${entries.length})',
-                    style: const TextStyle(
-                        fontWeight: FontWeight.bold,
-                        decoration: TextDecoration.none)),
-                style: ElevatedButton.styleFrom(
-                    backgroundColor: AppTheme.blue,
-                    foregroundColor: Colors.white,
-                    shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(12))),
-              ),
-            ),
-          ),
-        ]),
-      ),
-    );
   }
 }

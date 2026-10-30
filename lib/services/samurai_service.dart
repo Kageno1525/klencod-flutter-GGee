@@ -73,7 +73,7 @@ class SamuraiAttackConfig {
   final int toolL;
   final int toolR;
   final int toolM;
-  final bool attackDaimyoCastles;  // ✅ جديد
+  final bool attackDaimyoCastles;
 
   const SamuraiAttackConfig({
     this.waves = 3,
@@ -81,7 +81,7 @@ class SamuraiAttackConfig {
     this.toolL = 20,
     this.toolR = 20,
     this.toolM = 30,
-    this.attackDaimyoCastles = false,  // ✅ default OFF
+    this.attackDaimyoCastles = false,
   });
 
   bool get useTools =>
@@ -135,6 +135,9 @@ class SamuraiCamp {
   });
 
   bool get isDaimyoCastle => kDaimyoCastleTypes.contains(type);
+
+  // ✅ جديد: هل المعسكر مملوك للاعب؟
+  bool get isPlayerCamp => ownerId != -1;
 
   String get typeName {
     if (type == kSamuraiCampType) return 'Samurai Camp';
@@ -221,7 +224,7 @@ class SamuraiSettings {
     this.sourceAreaId = 0,
     this.maxLevel = 100,
     this.skipPlayerCamps = true,
-    this.includeDaimyoInScan = false,  // ✅ default: مش بنعرضهم
+    this.includeDaimyoInScan = false,
   });
 
   static const _kRadius = 'samurai_radius_v1';
@@ -363,7 +366,7 @@ class SamuraiService {
     required int radiusTiles,
     int maxLevel = 100,
     bool skipPlayerCamps = true,
-    bool includeDaimyo = false,  // ✅ جديد
+    bool includeDaimyo = false,
     void Function(int done, int total)? onProgress,
   }) async {
     if (_lastScanAt != null &&
