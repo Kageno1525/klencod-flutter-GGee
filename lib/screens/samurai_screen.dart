@@ -6,6 +6,7 @@ import 'package:gge/gge_client.dart';
 import 'package:gge/models.dart';
 import 'package:gge/services/samurai_service.dart';
 import 'package:gge/services/samurai_auto_service.dart';
+import 'package:gge/services/background_service.dart';
 import 'package:gge/theme.dart';
 import 'package:gge/widgets/animated_widgets.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -14,7 +15,6 @@ const Color kSamuraiRed = Color(0xFFDC2626);
 const Color kSamuraiDark = Color(0xFF7F1D1D);
 const Color kSamuraiGold = Color(0xFFD4AF37);
 
-// ⚠️ المفاتيح دي لازم تطابق اللي في background_service.dart
 const String kBgMaxLevelKey = 'samurai_max_level_v1';
 const String kBgSkipDaimyoKey = 'samurai_skip_daimyo_v1';
 const String kBgRadiusKey = 'samurai_radius_v1';
@@ -41,12 +41,10 @@ class _SamuraiScreenState extends State<SamuraiScreen>
   int _scanDone = 0, _scanTotal = 0;
   bool _loading = true;
 
-  // Auto data
   List<CommanderInfo> _allCommanders = [];
   Set<int> _selectedCommanderIds = {};
   bool _loadingAutoData = false;
 
-  // Auto settings
   bool _autoEnabled = false;
   int _minUnits = 30;
   int _delayMin = 10;
@@ -60,7 +58,6 @@ class _SamuraiScreenState extends State<SamuraiScreen>
   int _toolR = 20;
   int _toolM = 30;
 
-  // ✅ حالة الـ Background Service
   bool _bgRunning = false;
   String _bgStatusText = '';
   String _bgStatusExtra = '';
@@ -108,18 +105,14 @@ class _SamuraiScreenState extends State<SamuraiScreen>
     }
   }
 
-  // ✅ تحميل الإعدادات من المفاتيح الصح (اللي الـ background بيقرا منها)
   Future<void> _loadAutoSettings() async {
     final prefs = await SharedPreferences.getInstance();
     final enabled = await _auto.isEnabled();
     final minUnits = await _auto.getMinUnits();
     final delayMin = await _auto.getDelayMin();
     final delayMax = await _auto.getDelayMax();
-
-    // ⚠️ المفاتيح اللي الـ background بيستخدمها
     final maxLevel = prefs.getInt(kBgMaxLevelKey) ?? 60;
     final skipDaimyo = prefs.getBool(kBgSkipDaimyoKey) ?? true;
-
     final maxAttacksDay = await _auto.getMaxAttacksDay();
     final waves = await _auto.getWaves();
     final toolId = await _auto.getToolId();
@@ -146,21 +139,19 @@ class _SamuraiScreenState extends State<SamuraiScreen>
     });
   }
 
-  // ✅ حفظ Max Level في المفاتيح الصح (bg + auto)
   Future<void> _saveMaxLevel(int v) async {
     setState(() => _maxLevel = v);
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setInt(kBgMaxLevelKey, v);       // ← background
-    await prefs.setInt('samurai_auto_max_level', v); // ← auto service
+    await prefs.setInt(kBgMaxLevelKey, v);
+    await prefs.setInt('samurai_auto_max_level', v);
     await _settings.save();
   }
 
-  // ✅ حفظ Skip Daimyo في المفاتيح الصح
   Future<void> _saveSkipDaimyo(bool v) async {
     setState(() => _skipDaimyo = v);
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(kBgSkipDaimyoKey, v);        // ← background
-    await prefs.setBool('samurai_auto_skip_daimyo', v); // ← auto service
+    await prefs.setBool(kBgSkipDaimyoKey, v);
+    await prefs.setBool('samurai_auto_skip_daimyo', v);
   }
 
   void _startStatusPolling() {
@@ -195,9 +186,19 @@ class _SamuraiScreenState extends State<SamuraiScreen>
     super.dispose();
   }
 
-  // ═══════════════════════════════════════════════════════
-  //  Manual scan
-  // ═══════════════════════════════════════════════════════
+  Future<void> _restartBackgroundService() async {
+    try {
+      await BackgroundService.stop();
+      await Future.delayed(const Duration(seconds: 2));
+      await BackgroundService.start();
+      if (mounted) {
+        _snack('🔄 جارٍ إعادة التشغيل...', color: AppTheme.orange);
+      }
+    } catch (e) {
+      if (mounted) _snack('فشل: $e', color: AppTheme.red);
+    }
+  }
+
   Future<void> _scan() async {
     if (_source == null) {
       _snack('اختر قلعة مصدر أولاً', color: AppTheme.red);
@@ -255,9 +256,6 @@ class _SamuraiScreenState extends State<SamuraiScreen>
       ));
   }
 
-  // ═══════════════════════════════════════════════════════
-  //  ✅ Auto toggle — يتعامل مع background + foreground
-  // ═══════════════════════════════════════════════════════
   Future<void> _toggleAuto() async {
     if (_source == null) {
       _snack('اختر قلعة مصدر أولاً', color: AppTheme.red);
@@ -270,7 +268,6 @@ class _SamuraiScreenState extends State<SamuraiScreen>
     }
 
     if (_autoEnabled) {
-      // ═══ إيقاف ═══
       _auto.stop();
       await _auto.setEnabled(false);
       if (mounted) {
@@ -280,8 +277,6 @@ class _SamuraiScreenState extends State<SamuraiScreen>
       return;
     }
 
-    // ═══ تشغيل ═══
-    // 1. حفظ المصدر
     await _auto.setSource(
       areaId: _source!.areaId,
       kid: _source!.kingdomId,
@@ -289,16 +284,12 @@ class _SamuraiScreenState extends State<SamuraiScreen>
       y: _source!.y,
     );
 
-    // 2. حفظ كل الإعدادات في المفاتيح الصح
     final prefs = await SharedPreferences.getInstance();
     await prefs.setInt(kBgMaxLevelKey, _maxLevel);
     await prefs.setBool(kBgSkipDaimyoKey, _skipDaimyo);
     await prefs.setInt(kBgRadiusKey, _settings.radiusTiles);
 
-    // 3. تفعيل الـ flag
     await _auto.setEnabled(true);
-
-    // 4. تشغيل الـ foreground auto (هيتخطى نفسه تلقائيًا لو background شغال)
     await _auto.start(widget.client, sourceAreaId: _source!.areaId);
 
     if (mounted) {
@@ -314,9 +305,6 @@ class _SamuraiScreenState extends State<SamuraiScreen>
     }
   }
 
-  // ═══════════════════════════════════════════════════════
-  //  Auto: load commanders
-  // ═══════════════════════════════════════════════════════
   Future<void> _loadAutoData() async {
     if (_loadingAutoData) return;
     setState(() => _loadingAutoData = true);
@@ -364,9 +352,6 @@ class _SamuraiScreenState extends State<SamuraiScreen>
     if (mounted) setState(() => _selectedCommanderIds = result);
   }
 
-  // ═══════════════════════════════════════════════════════
-  //  Build
-  // ═══════════════════════════════════════════════════════
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -502,9 +487,6 @@ class _SamuraiScreenState extends State<SamuraiScreen>
     );
   }
 
-  // ═══════════════════════════════════════════════════════
-  //  Manual Tab
-  // ═══════════════════════════════════════════════════════
   Widget _manualTab() {
     final filtered = _camps.toList()
       ..sort((a, b) =>
@@ -531,9 +513,6 @@ class _SamuraiScreenState extends State<SamuraiScreen>
     );
   }
 
-  // ═══════════════════════════════════════════════════════
-  //  Auto Tab
-  // ═══════════════════════════════════════════════════════
   Widget _autoTab() {
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
@@ -552,9 +531,7 @@ class _SamuraiScreenState extends State<SamuraiScreen>
   }
 
   Widget _bigStatusCard() {
-    // ⚠️ هل فعلاً شغال؟ (foreground أو background)
-    final effectivelyRunning =
-        _autoEnabled && (_bgRunning || _auto.isRunning);
+    final effectivelyRunning = _autoEnabled && (_bgRunning || _auto.isRunning);
     final status = _auto.statusNotifier.value;
     final attacks = _auto.attacksThisSession;
     final camps = _auto.campsScanned;
@@ -562,11 +539,16 @@ class _SamuraiScreenState extends State<SamuraiScreen>
         .where((e) => e.message.startsWith('❌'))
         .length;
 
-    // ✅ لون وإيموجي حسب الحالة
     Color cardColor1, cardColor2;
     IconData icon;
     String title;
     String subtitle;
+
+    final isError = _bgStatusText.contains('FAILED') ||
+        _bgStatusText.contains('EXPIRED') ||
+        _bgStatusText.contains('NO_TOKEN') ||
+        _bgStatusText.contains('BANNED') ||
+        _bgStatusText.contains('ERROR');
 
     if (!_autoEnabled) {
       cardColor1 = const Color(0xFF37474F);
@@ -574,12 +556,24 @@ class _SamuraiScreenState extends State<SamuraiScreen>
       icon = Icons.pause_rounded;
       title = 'Auto متوقف';
       subtitle = 'في انتظار التشغيل';
-    } else if (_bgRunning) {
+    } else if (isError) {
+      cardColor1 = const Color(0xFFDC2626);
+      cardColor2 = const Color(0xFF991B1B);
+      icon = Icons.error_rounded;
+      title = '🔴 $_bgStatusText';
+      subtitle = _bgStatusExtra.isNotEmpty ? _bgStatusExtra : 'محتاج تدخل';
+    } else if (_bgRunning && _bgStatusText == 'ONLINE') {
       cardColor1 = const Color(0xFF16A34A);
       cardColor2 = const Color(0xFF15803D);
       icon = Icons.bolt_rounded;
       title = '🔒 Auto في الخلفية ✓';
-      subtitle = 'Background Service شغال · ${_bgStatusExtra.isNotEmpty ? _bgStatusExtra : "24/7"}';
+      subtitle = 'Background Service شغال · 24/7';
+    } else if (_bgRunning) {
+      cardColor1 = const Color(0xFFF59E0B);
+      cardColor2 = const Color(0xFFB45309);
+      icon = Icons.sync_rounded;
+      title = '⏳ [BG] $_bgStatusText';
+      subtitle = _bgStatusExtra.isNotEmpty ? _bgStatusExtra : 'جارٍ الاتصال...';
     } else if (_auto.isRunning) {
       cardColor1 = const Color(0xFF2196F3);
       cardColor2 = const Color(0xFF1565C0);
@@ -591,7 +585,7 @@ class _SamuraiScreenState extends State<SamuraiScreen>
       cardColor2 = const Color(0xFFB45309);
       icon = Icons.warning_rounded;
       title = '⚠️ Auto مفعّل بس مش شغال';
-      subtitle = 'شغّل Background Service للعمل 24/7';
+      subtitle = 'شغّل Background Service';
     }
 
     return Container(
@@ -679,18 +673,41 @@ class _SamuraiScreenState extends State<SamuraiScreen>
                 const SizedBox(height: 4),
                 Text(
                     _bgRunning && _bgStatusText.isNotEmpty
-                        ? '[BG] $_bgStatusText'
+                        ? '[$_bgStatusText] ${_bgStatusExtra.isNotEmpty ? "· $_bgStatusExtra" : ""}'
                         : status,
                     style: const TextStyle(
                         color: Colors.white,
-                        fontSize: 14,
+                        fontSize: 13,
                         fontWeight: FontWeight.bold,
                         decoration: TextDecoration.none),
-                    maxLines: 2,
+                    maxLines: 3,
                     overflow: TextOverflow.ellipsis),
               ],
             ),
           ),
+          if (isError || (_bgRunning && _bgStatusText != 'ONLINE')) ...[
+            const SizedBox(height: 8),
+            SizedBox(
+              width: double.infinity,
+              height: 36,
+              child: ElevatedButton.icon(
+                onPressed: _restartBackgroundService,
+                icon: const Icon(Icons.restart_alt_rounded,
+                    size: 16, color: Colors.white),
+                label: const Text('إعادة تشغيل Service',
+                    style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                        decoration: TextDecoration.none)),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.white.withOpacity(0.2),
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8)),
+                ),
+              ),
+            ),
+          ],
           const SizedBox(height: 10),
           Row(children: [
             Expanded(child: _miniStat('معسكرات', camps.toString())),
@@ -920,7 +937,6 @@ class _SamuraiScreenState extends State<SamuraiScreen>
                     decoration: TextDecoration.none)),
           ]),
           const SizedBox(height: 12),
-
           Text('التأخير بين الهجمات (ثواني)',
               style: TextStyle(
                   fontSize: 12,
@@ -944,11 +960,9 @@ class _SamuraiScreenState extends State<SamuraiScreen>
               }),
             ),
           ]),
-
           const SizedBox(height: 12),
           Divider(color: AppTheme.subTextColor(context).withOpacity(0.15)),
           const SizedBox(height: 8),
-
           Row(children: [
             Expanded(
               child: _numberField('أقل وحدات', '$_minUnits', _minUnits, (v) async {
@@ -970,11 +984,9 @@ class _SamuraiScreenState extends State<SamuraiScreen>
               }),
             ),
           ]),
-
           const SizedBox(height: 12),
           Divider(color: AppTheme.subTextColor(context).withOpacity(0.15)),
           const SizedBox(height: 8),
-
           Row(children: [
             const Text('Waves:',
                 style: TextStyle(
@@ -1000,7 +1012,6 @@ class _SamuraiScreenState extends State<SamuraiScreen>
                     fontWeight: FontWeight.bold,
                     decoration: TextDecoration.none)),
           ]),
-
           SwitchListTile(
             contentPadding: EdgeInsets.zero,
             title: Text('الأدوات (WID $_toolId)',
@@ -1036,7 +1047,6 @@ class _SamuraiScreenState extends State<SamuraiScreen>
               }
             },
           ),
-
           if ((_toolL + _toolR + _toolM) > 0)
             Row(children: [
               Expanded(
@@ -1060,7 +1070,6 @@ class _SamuraiScreenState extends State<SamuraiScreen>
                 }),
               ),
             ]),
-
           const SizedBox(height: 8),
           SwitchListTile(
             contentPadding: EdgeInsets.zero,
@@ -1173,9 +1182,6 @@ class _SamuraiScreenState extends State<SamuraiScreen>
     );
   }
 
-  // ═══════════════════════════════════════════════════════
-  //  Shared widgets
-  // ═══════════════════════════════════════════════════════
   Widget _sourcePicker() {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
@@ -1510,9 +1516,6 @@ class _SamuraiScreenState extends State<SamuraiScreen>
     }
   }
 
-  // ═══════════════════════════════════════════════════════
-  //  Dialogs
-  // ═══════════════════════════════════════════════════════
   void _openRadiusDialog() {
     double temp = _settings.radiusTiles.toDouble();
     showDialog(
@@ -1551,7 +1554,6 @@ class _SamuraiScreenState extends State<SamuraiScreen>
                   _settings.radiusTiles = temp.toInt();
                 });
                 await _settings.save();
-                // ✅ حفظ في مفتاح background أيضًا
                 final prefs = await SharedPreferences.getInstance();
                 await prefs.setInt(kBgRadiusKey, temp.toInt());
                 if (ctx.mounted) Navigator.pop(ctx);
@@ -1642,7 +1644,6 @@ class _SamuraiScreenState extends State<SamuraiScreen>
                   _settings.includeDaimyoInScan = includeDaimyo;
                 });
                 await _settings.save();
-                // ✅ حفظ maxLevel في مفتاح background
                 final prefs = await SharedPreferences.getInstance();
                 await prefs.setInt(kBgMaxLevelKey, maxLevel);
                 if (ctx.mounted) Navigator.pop(ctx);
@@ -1656,9 +1657,6 @@ class _SamuraiScreenState extends State<SamuraiScreen>
   }
 }
 
-// ═══════════════════════════════════════════════════════
-//  Multi-select sheet
-// ═══════════════════════════════════════════════════════
 class _SelectItem {
   final int id;
   final String label;
@@ -1813,9 +1811,6 @@ class _MultiSelectSheetState extends State<_MultiSelectSheet> {
   }
 }
 
-// ═══════════════════════════════════════════════════════
-//  Attack sheet (manual)
-// ═══════════════════════════════════════════════════════
 class _SamuraiAttackSheet extends StatefulWidget {
   final GgeClient client;
   final OwnedCastle source;

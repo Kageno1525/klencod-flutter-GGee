@@ -92,7 +92,6 @@ class _GgeTaskHandler extends TaskHandler {
   Timer? _pollTimer;
   Timer? _trainTimer;
   Timer? _desertTimer;
-  Timer? _samuraiTimer;
   bool _connected = false;
   bool _loggedIn = false;
   String? _token;
@@ -142,6 +141,7 @@ class _GgeTaskHandler extends TaskHandler {
   DateTime? _samuraiLastScanAt;
   final Map<String, DateTime> _samuraiFailedCamps = {};
 
+  Timer? _samuraiTimer;
   bool _runningSamurai = false;
 
   static const int _kSamuraiCampType = 29;
@@ -481,24 +481,40 @@ class _GgeTaskHandler extends TaskHandler {
   Future<void> _connect() async {
     try {
       _log('Connecting...');
-      await _saveStatus('CONNECTING');
+      await _saveStatus('CONNECTING', extra: 'WebSocket...');
       _ws = await WebSocket.connect(_url).timeout(const Duration(seconds: 20));
       _connected = true;
       _log('WS Connected');
+      await _saveStatus('WS_OPEN', extra: 'waiting verChk...');
       _ws!.add('<msg t="sys"><body action="verChk" r="0"><ver v="166" /></body></msg>');
-      _sub = _ws!.listen((data) => _onMessage(data.toString()),
-        onDone: () { _connected = false; _loggedIn = false; _scheduleReconnect(); },
-        onError: (_) { _connected = false; _loggedIn = false; _scheduleReconnect(); },
+      _sub = _ws!.listen(
+        (data) => _onMessage(data.toString()),
+        onDone: () {
+          _connected = false;
+          _loggedIn = false;
+          _saveStatus('WS_CLOSED', extra: 'reconnecting...');
+          _scheduleReconnect();
+        },
+        onError: (e) {
+          _connected = false;
+          _loggedIn = false;
+          _saveStatus('WS_ERROR', extra: e.toString());
+          _scheduleReconnect();
+        },
       );
     } catch (e) {
       _log('Connect error: $e');
+      await _saveStatus('WS_FAILED', extra: e.toString());
       _scheduleReconnect();
     }
   }
 
   void _scheduleReconnect() {
-    Future.delayed(const Duration(seconds: 10), () {
-      if (!_connected) _connect();
+    Future.microtask(() async {
+      await _saveStatus('RECONNECTING', extra: 'في 10 ثواني...');
+      Future.delayed(const Duration(seconds: 10), () {
+        if (!_connected) _connect();
+      });
     });
   }
 
@@ -513,35 +529,69 @@ class _GgeTaskHandler extends TaskHandler {
   }
 
   Future<void> _onMessage(String text) async {
+    // ═══════ Login flow ═══════
     if (text.contains('apiOK')) {
+      _log('✓ apiOK received');
+      _saveStatus('API_OK', extra: 'sending login...');
       _sendSys('<msg t="sys"><body action="login" r="0"><login z="$_gameServer"><nick><![CDATA[]]></nick><pword><![CDATA[undefined%en%0]]></pword></login></body></msg>');
+    } else if (text.contains('rlu') && !text.contains('joinOK')) {
+      _log('✓ rlu received → sending autoJoin');
+      _saveStatus('RLU_OK', extra: 'sending autoJoin...');
+      _sendSys('<msg t="sys"><body action="autoJoin" r="-1"></body></msg>');
     } else if (text.contains('joinOK')) {
+      _log('✓ joinOK received → sending vck');
+      _saveStatus('JOINED', extra: 'sending vck...');
       _sendSys('<msg t="sys"><body action="roundTrip" r="1"></body></msg>');
       final rand = Random().nextDouble() * 9e307;
       _sendXt('vck', 'undefined%web-html5%<RoundHouseKick>%${rand.toStringAsExponential(16)}');
     } else if (text.startsWith('%xt%') && text.contains('%vck%')) {
+      _log('✓ vck confirmed → sending lli');
       _doLogin();
     } else if (text.startsWith('%xt%') && text.contains('%lli%')) {
       if (text.contains('%lli%1%0%')) {
         _loggedIn = true;
-        _log('Login OK');
-        await _saveStatus('ONLINE');
+        _log('✅ Login OK');
+        await _saveStatus('ONLINE', extra: 'متصل ✓');
         _runInit();
+      } else if (text.contains('%lli%1%409%')) {
+        _log('🔴 TOKEN EXPIRED (409)');
+        await _saveStatus('TOKEN_EXPIRED',
+            extra: 'افتح التطبيق وسجّل دخول من جديد');
+        _loggedIn = false;
+        _connected = false;
+        try { await _ws?.close(); } catch (_) {}
+        _ws = null;
+        try {
+          await FlutterForegroundTask.updateService(
+            notificationTitle: '⚠️ GGE Bot — التوكن انتهى',
+            notificationText: 'افتح التطبيق وسجّل دخول من جديد',
+          );
+        } catch (_) {}
+        return;
+      } else if (text.contains('%lli%1%87%') || text.contains('%lli%1%88%')) {
+        _log('🚫 Banned temporarily: $text');
+        await _saveStatus('BANNED', extra: 'حظر مؤقت');
       } else {
-        _log('Login FAILED');
-        await _saveStatus('LOGIN_FAILED');
+        _log('❌ Login FAILED: ${text.length > 80 ? text.substring(0, 80) : text}');
+        final snippet = text.length > 40 ? text.substring(0, 40) : text;
+        await _saveStatus('LOGIN_FAILED', extra: snippet);
       }
-    } else if (text.contains('bup%1%0%')) {
+    }
+
+    // ═══════ bup (train) ═══════
+    if (text.contains('bup%1%0%')) {
       _log('BUP OK');
     } else if (text.contains('bup%1%87%') || text.contains('bup%1%88%')) {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString('auto_last_train_time', DateTime.now().toIso8601String());
     }
 
+    // ═══════ Dispatch to pending ═══════
     if (text.startsWith('%xt%')) {
       _dispatchToPending(text);
     }
 
+    // ═══════ Spy report ═══════
     if (text.startsWith('%xt%') && text.contains('%sne%')) {
       try {
         final xt = _parseXt(text);
@@ -566,7 +616,13 @@ class _GgeTaskHandler extends TaskHandler {
   }
 
   void _doLogin() {
-    if (_token == null) { _log('No token'); return; }
+    if (_token == null || _token!.isEmpty) {
+      _log('❌ Token missing');
+      _saveStatus('NO_TOKEN', extra: 'سجّل دخول من التطبيق الرئيسي');
+      return;
+    }
+    _log('Sending lli (token: ${_token!.substring(0, min(20, _token!.length))}...)');
+    _saveStatus('LOGGING_IN', extra: 'sending lli...');
     _sendXt('lli', jsonEncode({
       'CONM': 350, 'RTM': 57, 'ID': 0, 'PL': 1,
       'NOM': 'User', 'LT': _token, 'LANG': 'en', 'DID': '0',
@@ -1113,29 +1169,8 @@ class _GgeTaskHandler extends TaskHandler {
   }
 
   Future<void> _samuraiTick() async {
-    // ✅ Re-read config كل tick
-    final prefs = await SharedPreferences.getInstance();
-    _samuraiEnabled = prefs.getBool('samurai_auto_enabled') ?? false;
-
     if (!_loggedIn || !_samuraiEnabled) return;
-
-    _samuraiSourceAreaId = prefs.getInt('samurai_auto_source_area');
-    _samuraiSourceKid = prefs.getInt('samurai_auto_source_kid');
-    _samuraiRadius = prefs.getInt('samurai_radius_v1') ?? 5;
-    _samuraiMaxLevel = prefs.getInt('samurai_max_level_v1') ?? 60;
-    _samuraiSkipDaimyo = prefs.getBool('samurai_skip_daimyo_v1') ?? true;
-    _samuraiMinUnits = prefs.getInt('samurai_auto_min_units') ?? 30;
-    _samuraiWaves = prefs.getInt('samurai_auto_waves') ?? 3;
-    _samuraiToolId = prefs.getInt('samurai_auto_tool_id') ?? 166;
-    _samuraiToolL = prefs.getInt('samurai_auto_tool_l') ?? 20;
-    _samuraiToolR = prefs.getInt('samurai_auto_tool_r') ?? 20;
-    _samuraiToolM = prefs.getInt('samurai_auto_tool_m') ?? 30;
-    _samuraiMaxAttacksDay = prefs.getInt('samurai_auto_max_attacks_day') ?? 0;
-
-    if (_samuraiSourceAreaId == null || _samuraiSourceAreaId == 0) {
-      _log('Samurai: no source area');
-      return;
-    }
+    if (_samuraiSourceAreaId == null || _samuraiSourceAreaId == 0) return;
 
     final today = _todayStr();
     if (_samuraiAttacksDate != today) {
