@@ -6,6 +6,7 @@ import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../gge_client.dart';
 import '../models.dart';
+import 'background_service.dart';
 import 'samurai_service.dart';
 
 class SamuraiAutoStatusEntry {
@@ -31,8 +32,9 @@ class SamuraiAutoService {
   static const _kToolR = 'samurai_auto_tool_r';
   static const _kToolM = 'samurai_auto_tool_m';
   static const _kWaves = 'samurai_auto_waves';
-  static const _kMaxLevel = 'samurai_auto_max_level';
+  static const _kMaxLevel = 'samurai_max_level_v1';
   static const _kSkipDaimyo = 'samurai_skip_daimyo_v1';
+  static const _kRadius = 'samurai_radius_v1';
   static const _kDelayMin = 'samurai_auto_delay_min';
   static const _kDelayMax = 'samurai_auto_delay_max';
   static const _kMaxAttacksDay = 'samurai_auto_max_attacks_day';
@@ -69,6 +71,7 @@ class SamuraiAutoService {
   int campsScanned = 0;
 
   Timer? _timer;
+  Timer? _syncTimer;
   bool _running = false;
   SamuraiService? _svc;
   GgeClient? _client;
@@ -169,6 +172,14 @@ class SamuraiAutoService {
     await p.setBool(_kSkipDaimyo, v);
   }
 
+  Future<int> getRadius() async =>
+      (await SharedPreferences.getInstance()).getInt(_kRadius) ?? kCampsScanRadius;
+
+  Future<void> setRadius(int v) async {
+    final p = await SharedPreferences.getInstance();
+    await p.setInt(_kRadius, v.clamp(5, 100));
+  }
+
   Future<int> getDelayMin() async =>
       (await SharedPreferences.getInstance()).getInt(_kDelayMin) ?? kDefDelayMin;
 
@@ -208,55 +219,105 @@ class SamuraiAutoService {
 
   // ═══ Start / Stop ═══
   Future<void> start(GgeClient client, {int? sourceAreaId}) async {
-    if (_running) {
-      TrafficLog.add('ST', '[Samurai-Auto] already running');
-      return;
-    }
+    if (_running) return;
 
-    // ✅ لو Background شغال، متبدأش (هو المسؤول عن الهجمات)
-    final bgRunning = await FlutterForegroundTask.isRunningService;
-    if (bgRunning) {
-      TrafficLog.add('ST',
-          '[Samurai-Auto] ⚠️ Background service active — local attacks disabled');
-      _setStatus('💤 Background handles attacks');
-      return;
-    }
+    // 1️⃣ فعّل Samurai في prefs (الـ background هيقراها)
+    await setEnabled(true);
 
-    if (_activeTick != null) {
-      TrafficLog.add('ST', '[Samurai-Auto] ⏳ waiting for old tick...');
-      try { await _activeTick!.timeout(const Duration(seconds: 60)); } catch (_) {}
-    }
-
-    _attackedThisTick.clear();
-    _client = client;
-    _svc = SamuraiService(client);
-    await _svc!.loadCooldowns();
-    await _loadFailedCamps();
-    await _loadCooldowns();
-
-    attacksThisSession = 0;
-    campsScanned = 0;
-
+    // 2️⃣ احفظ المصدر
     if (sourceAreaId != null && sourceAreaId > 0) {
       final p = await SharedPreferences.getInstance();
       await p.setInt(_kSourceAreaId, sourceAreaId);
+      TrafficLog.add('ST',
+          '[Samurai-Auto] Source saved: $sourceAreaId');
     }
 
-    _running = true;
-    _setStatus('🚀 Started (foreground only)');
-    TrafficLog.add('ST', '[Samurai-Auto] 🚀 Started (foreground mode)');
-    _tick();
+    // 3️⃣ شغّل الـ background service لو مش شغال
+    final bgRunning = await FlutterForegroundTask.isRunningService;
+    if (!bgRunning) {
+      TrafficLog.add('ST', '[Samurai-Auto] Starting background service...');
+      final ok = await BackgroundService.start();
+      if (!ok) {
+        await setEnabled(false);
+        _running = false;
+        _setStatus('❌ Failed to start background');
+        return;
+      }
+      await Future.delayed(const Duration(seconds: 2));
+    }
 
+    // 4️⃣ فعّل الحالة
+    _running = true;
+    _client = client;
+    attacksThisSession = 0;
+    campsScanned = 0;
+
+    TrafficLog.add('ST',
+        '[Samurai-Auto] 🚀 Started — background will handle attacks');
+    _setStatus('🚀 Started');
+
+    // 5️⃣ مزامنة الستاتس من الـ background كل 5 ثواني
+    _syncTimer?.cancel();
+    _syncTimer = Timer.periodic(const Duration(seconds: 5),
+        (_) => _syncBackgroundStatus());
+
+    // 6️⃣ لو الـ background مش شغال، fallback للهجمات المحلية
     _timer?.cancel();
     _timer = Timer.periodic(const Duration(seconds: 30), (_) => _tick());
   }
 
-  void stop() {
+  Future<void> stop() async {
+    // 1️⃣ اقفل الـ Samurai في prefs
+    await setEnabled(false);
+
+    // 2️⃣ اقفل كل الـ timers
     _timer?.cancel();
     _timer = null;
+    _syncTimer?.cancel();
+    _syncTimer = null;
     _running = false;
-    _setStatus('🛑 Stopped');
+
     TrafficLog.add('ST', '[Samurai-Auto] 🛑 Stopped');
+    _setStatus('🛑 Stopped');
+  }
+
+  /// ✅ استدعها في initState عشان الـ toggle يطابق الحقيقة
+  Future<void> restoreState() async {
+    final enabled = await isEnabled();
+    if (!enabled) {
+      _running = false;
+      _setStatus('Idle');
+      return;
+    }
+
+    final bgRunning = await FlutterForegroundTask.isRunningService;
+    _running = bgRunning;
+
+    if (bgRunning) {
+      _setStatus('🚀 Active (background)');
+      _syncTimer?.cancel();
+      _syncTimer = Timer.periodic(const Duration(seconds: 5),
+          (_) => _syncBackgroundStatus());
+    } else {
+      _setStatus('⏸️ Paused (background off)');
+    }
+  }
+
+  Future<void> _syncBackgroundStatus() async {
+    if (!_running) return;
+    try {
+      final status =
+          await FlutterForegroundTask.getData<String>(key: 'bg_status');
+      final extra =
+          await FlutterForegroundTask.getData<String>(key: 'bg_extra');
+      if (status == null) return;
+      final display = (extra != null && extra.isNotEmpty)
+          ? '$status · $extra'
+          : status;
+      if (statusNotifier.value != display) {
+        statusNotifier.value = display;
+      }
+    } catch (_) {}
   }
 
   void _setStatus(String s) {
@@ -332,6 +393,24 @@ class SamuraiAutoService {
   // ═══ Tick ═══
   Future<void> _tick() async {
     if (!_running) return;
+
+    // ✅ مزامنة الستاتس من الـ background
+    await _syncBackgroundStatus();
+
+    // ✅ لو الـ background شغال، هو المسؤول — مفيش هجمات محلية
+    final bgRunning = await FlutterForegroundTask.isRunningService;
+    if (bgRunning) return;
+
+    // Fallback: هجمات محلية لو الـ background مش شغال
+    if (!await isEnabled()) return;
+    if (_client == null || _svc == null) {
+      _client ??= GgeClient();
+      _svc = SamuraiService(_client!);
+      await _svc!.loadCooldowns();
+      await _loadFailedCamps();
+      await _loadCooldowns();
+    }
+
     if (_activeTick != null) return;
     _activeTick = _doTick();
     try {
@@ -344,18 +423,7 @@ class SamuraiAutoService {
   }
 
   Future<void> _doTick() async {
-    if (!await isEnabled()) {
-      _setStatus('⏸️ Disabled');
-      return;
-    }
     if (_client == null || _svc == null) return;
-
-    // ✅ لو Background شغال، هو المسؤول
-    final bgRunning = await FlutterForegroundTask.isRunningService;
-    if (bgRunning) {
-      _setStatus('💤 Background service active');
-      return;
-    }
 
     const initialStatus = '⏱️ Checking...';
     _setStatus(initialStatus);
@@ -408,11 +476,12 @@ class SamuraiAutoService {
 
       final maxLevel = p.getInt(_kMaxLevel) ?? kDefMaxLevel;
       final skipDaimyo = p.getBool(_kSkipDaimyo) ?? true;
+      final radius = p.getInt(_kRadius) ?? kCampsScanRadius;
 
       _setStatus('🔍 Scanning camps...');
       _camps = await _svc!.scanArea(
         source: source,
-        radiusTiles: kCampsScanRadius,
+        radiusTiles: radius,
         maxLevel: maxLevel,
         skipPlayerCamps: true,
         includeDaimyo: !skipDaimyo,
@@ -428,7 +497,7 @@ class SamuraiAutoService {
     }
   }
 
-  // ═══ Attack Loop (fallback فقط لما Background مقفول) ═══
+  // ═══ Attack Loop (fallback فقط) ═══
   Future<void> _tryAttackCamps() async {
     if (_client == null || _svc == null) return;
 

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:gge/gge_client.dart';
 import 'package:gge/models.dart';
 import 'package:gge/services/samurai_service.dart';
@@ -12,6 +13,11 @@ import 'package:shared_preferences/shared_preferences.dart';
 const Color kSamuraiRed = Color(0xFFDC2626);
 const Color kSamuraiDark = Color(0xFF7F1D1D);
 const Color kSamuraiGold = Color(0xFFD4AF37);
+
+// ⚠️ المفاتيح دي لازم تطابق اللي في background_service.dart
+const String kBgMaxLevelKey = 'samurai_max_level_v1';
+const String kBgSkipDaimyoKey = 'samurai_skip_daimyo_v1';
+const String kBgRadiusKey = 'samurai_radius_v1';
 
 class SamuraiScreen extends StatefulWidget {
   final GgeClient client;
@@ -53,6 +59,11 @@ class _SamuraiScreenState extends State<SamuraiScreen>
   int _toolL = 20;
   int _toolR = 20;
   int _toolM = 30;
+
+  // ✅ حالة الـ Background Service
+  bool _bgRunning = false;
+  String _bgStatusText = '';
+  String _bgStatusExtra = '';
 
   Timer? _statusTimer;
 
@@ -97,13 +108,18 @@ class _SamuraiScreenState extends State<SamuraiScreen>
     }
   }
 
+  // ✅ تحميل الإعدادات من المفاتيح الصح (اللي الـ background بيقرا منها)
   Future<void> _loadAutoSettings() async {
+    final prefs = await SharedPreferences.getInstance();
     final enabled = await _auto.isEnabled();
     final minUnits = await _auto.getMinUnits();
     final delayMin = await _auto.getDelayMin();
     final delayMax = await _auto.getDelayMax();
-    final maxLevel = await _auto.getMaxLevel();
-    final skipDaimyo = await _auto.getSkipDaimyo();
+
+    // ⚠️ المفاتيح اللي الـ background بيستخدمها
+    final maxLevel = prefs.getInt(kBgMaxLevelKey) ?? 60;
+    final skipDaimyo = prefs.getBool(kBgSkipDaimyoKey) ?? true;
+
     final maxAttacksDay = await _auto.getMaxAttacksDay();
     final waves = await _auto.getWaves();
     final toolId = await _auto.getToolId();
@@ -130,18 +146,45 @@ class _SamuraiScreenState extends State<SamuraiScreen>
     });
   }
 
+  // ✅ حفظ Max Level في المفاتيح الصح (bg + auto)
+  Future<void> _saveMaxLevel(int v) async {
+    setState(() => _maxLevel = v);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(kBgMaxLevelKey, v);       // ← background
+    await prefs.setInt('samurai_auto_max_level', v); // ← auto service
+    await _settings.save();
+  }
+
+  // ✅ حفظ Skip Daimyo في المفاتيح الصح
+  Future<void> _saveSkipDaimyo(bool v) async {
+    setState(() => _skipDaimyo = v);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(kBgSkipDaimyoKey, v);        // ← background
+    await prefs.setBool('samurai_auto_skip_daimyo', v); // ← auto service
+  }
+
   void _startStatusPolling() {
     _statusTimer?.cancel();
-    _statusTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+    _statusTimer = Timer.periodic(const Duration(seconds: 2), (_) async {
       if (!mounted) return;
-      final status = _auto.statusNotifier.value;
-      final running = _auto.isRunning;
-      final enabled = _autoEnabled;
-      if (running != enabled) {
-        setState(() => _autoEnabled = running);
+      try {
+        final bgRunning = await FlutterForegroundTask.isRunningService;
+        final status = await FlutterForegroundTask.getData<String>(
+                key: 'bg_status') ??
+            '';
+        final extra = await FlutterForegroundTask.getData<String>(
+                key: 'bg_extra') ??
+            '';
+        if (!mounted) return;
+        setState(() {
+          _bgRunning = bgRunning;
+          _bgStatusText = status;
+          _bgStatusExtra = extra;
+        });
+      } catch (_) {
+        if (mounted) setState(() => _bgRunning = false);
       }
-      // status notifier + counts
-      setState(() {});
+      if (mounted) setState(() {});
     });
   }
 
@@ -213,7 +256,7 @@ class _SamuraiScreenState extends State<SamuraiScreen>
   }
 
   // ═══════════════════════════════════════════════════════
-  //  Auto toggle — FOREGROUND (زي الصحراء)
+  //  ✅ Auto toggle — يتعامل مع background + foreground
   // ═══════════════════════════════════════════════════════
   Future<void> _toggleAuto() async {
     if (_source == null) {
@@ -227,7 +270,7 @@ class _SamuraiScreenState extends State<SamuraiScreen>
     }
 
     if (_autoEnabled) {
-      // إيقاف
+      // ═══ إيقاف ═══
       _auto.stop();
       await _auto.setEnabled(false);
       if (mounted) {
@@ -237,19 +280,37 @@ class _SamuraiScreenState extends State<SamuraiScreen>
       return;
     }
 
-    // تشغيل
+    // ═══ تشغيل ═══
+    // 1. حفظ المصدر
     await _auto.setSource(
       areaId: _source!.areaId,
       kid: _source!.kingdomId,
       x: _source!.x,
       y: _source!.y,
     );
+
+    // 2. حفظ كل الإعدادات في المفاتيح الصح
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(kBgMaxLevelKey, _maxLevel);
+    await prefs.setBool(kBgSkipDaimyoKey, _skipDaimyo);
+    await prefs.setInt(kBgRadiusKey, _settings.radiusTiles);
+
+    // 3. تفعيل الـ flag
     await _auto.setEnabled(true);
+
+    // 4. تشغيل الـ foreground auto (هيتخطى نفسه تلقائيًا لو background شغال)
     await _auto.start(widget.client, sourceAreaId: _source!.areaId);
 
     if (mounted) {
       setState(() => _autoEnabled = true);
-      _snack('✅ Auto شغال — بيهجم تلقائي', color: AppTheme.green);
+      final bgRunning = await FlutterForegroundTask.isRunningService;
+      if (bgRunning) {
+        _snack('✅ Auto شغال في الخلفية (Background Service)',
+            color: AppTheme.green);
+      } else {
+        _snack('✅ Auto شغال في المقدمة (Foreground)',
+            color: AppTheme.green);
+      }
     }
   }
 
@@ -491,7 +552,9 @@ class _SamuraiScreenState extends State<SamuraiScreen>
   }
 
   Widget _bigStatusCard() {
-    final running = _auto.isRunning;
+    // ⚠️ هل فعلاً شغال؟ (foreground أو background)
+    final effectivelyRunning =
+        _autoEnabled && (_bgRunning || _auto.isRunning);
     final status = _auto.statusNotifier.value;
     final attacks = _auto.attacksThisSession;
     final camps = _auto.campsScanned;
@@ -499,20 +562,50 @@ class _SamuraiScreenState extends State<SamuraiScreen>
         .where((e) => e.message.startsWith('❌'))
         .length;
 
+    // ✅ لون وإيموجي حسب الحالة
+    Color cardColor1, cardColor2;
+    IconData icon;
+    String title;
+    String subtitle;
+
+    if (!_autoEnabled) {
+      cardColor1 = const Color(0xFF37474F);
+      cardColor2 = const Color(0xFF546E7A);
+      icon = Icons.pause_rounded;
+      title = 'Auto متوقف';
+      subtitle = 'في انتظار التشغيل';
+    } else if (_bgRunning) {
+      cardColor1 = const Color(0xFF16A34A);
+      cardColor2 = const Color(0xFF15803D);
+      icon = Icons.bolt_rounded;
+      title = '🔒 Auto في الخلفية ✓';
+      subtitle = 'Background Service شغال · ${_bgStatusExtra.isNotEmpty ? _bgStatusExtra : "24/7"}';
+    } else if (_auto.isRunning) {
+      cardColor1 = const Color(0xFF2196F3);
+      cardColor2 = const Color(0xFF1565C0);
+      icon = Icons.play_circle_rounded;
+      title = '⚡ Auto في المقدمة ✓';
+      subtitle = 'شغال فقط لما التطبيق مفتوح';
+    } else {
+      cardColor1 = const Color(0xFFF59E0B);
+      cardColor2 = const Color(0xFFB45309);
+      icon = Icons.warning_rounded;
+      title = '⚠️ Auto مفعّل بس مش شغال';
+      subtitle = 'شغّل Background Service للعمل 24/7';
+    }
+
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
         gradient: LinearGradient(
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
-          colors: running
-              ? [const Color(0xFF16A34A), const Color(0xFF15803D)]
-              : [const Color(0xFF37474F), const Color(0xFF546E7A)],
+          colors: [cardColor1, cardColor2],
         ),
         borderRadius: BorderRadius.circular(16),
         boxShadow: [
           BoxShadow(
-            color: (running ? Colors.green : Colors.grey).withOpacity(0.3),
+            color: cardColor1.withOpacity(0.3),
             blurRadius: 20,
             offset: const Offset(0, 8),
           ),
@@ -528,31 +621,26 @@ class _SamuraiScreenState extends State<SamuraiScreen>
                 color: Colors.white.withOpacity(0.2),
                 borderRadius: BorderRadius.circular(10),
               ),
-              child: Icon(
-                  running ? Icons.bolt_rounded : Icons.pause_rounded,
-                  color: Colors.white,
-                  size: 24),
+              child: Icon(icon, color: Colors.white, size: 24),
             ),
             const SizedBox(width: 12),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                      running ? 'Auto يعمل ✓' : 'Auto متوقف',
+                  Text(title,
                       style: const TextStyle(
                           color: Colors.white,
-                          fontSize: 16,
+                          fontSize: 15,
                           fontWeight: FontWeight.bold,
                           decoration: TextDecoration.none)),
-                  Text(
-                      running
-                          ? 'هجمات كل $_delayMin-${_delayMax}s · $attacks هجمة'
-                          : 'في انتظار التشغيل',
+                  Text(subtitle,
                       style: const TextStyle(
                           color: Colors.white70,
-                          fontSize: 11,
-                          decoration: TextDecoration.none)),
+                          fontSize: 10.5,
+                          decoration: TextDecoration.none),
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis),
                 ],
               ),
             ),
@@ -563,7 +651,7 @@ class _SamuraiScreenState extends State<SamuraiScreen>
                 color: Colors.white.withOpacity(0.2),
                 borderRadius: BorderRadius.circular(8),
               ),
-              child: Text(running ? 'ON' : 'OFF',
+              child: Text(effectivelyRunning ? 'ON' : 'OFF',
                   style: const TextStyle(
                       color: Colors.white,
                       fontSize: 11,
@@ -589,23 +677,25 @@ class _SamuraiScreenState extends State<SamuraiScreen>
                         fontWeight: FontWeight.bold,
                         decoration: TextDecoration.none)),
                 const SizedBox(height: 4),
-                Text(status,
+                Text(
+                    _bgRunning && _bgStatusText.isNotEmpty
+                        ? '[BG] $_bgStatusText'
+                        : status,
                     style: const TextStyle(
                         color: Colors.white,
-                        fontSize: 15,
+                        fontSize: 14,
                         fontWeight: FontWeight.bold,
-                        decoration: TextDecoration.none)),
+                        decoration: TextDecoration.none),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis),
               ],
             ),
           ),
           const SizedBox(height: 10),
           Row(children: [
-            Expanded(
-                child: _miniStat('أبراج', camps.toString())),
-            Expanded(
-                child: _miniStat('هجمات', attacks.toString())),
-            Expanded(
-                child: _miniStat('أخطاء', errors.toString())),
+            Expanded(child: _miniStat('معسكرات', camps.toString())),
+            Expanded(child: _miniStat('هجمات', attacks.toString())),
+            Expanded(child: _miniStat('أخطاء', errors.toString())),
           ]),
         ],
       ),
@@ -669,6 +759,30 @@ class _SamuraiScreenState extends State<SamuraiScreen>
             style: OutlinedButton.styleFrom(
               foregroundColor: kSamuraiGold,
               side: const BorderSide(color: kSamuraiGold),
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(10)),
+            ),
+          ),
+        ),
+        const SizedBox(height: 10),
+        SizedBox(
+          width: double.infinity,
+          height: 40,
+          child: OutlinedButton.icon(
+            onPressed: () async {
+              await _auto.clearAllState();
+              if (mounted) {
+                _snack('🧹 تم مسح cooldowns + failed camps',
+                    color: AppTheme.green);
+              }
+            },
+            icon: const Icon(Icons.cleaning_services_rounded, size: 16),
+            label: const Text('مسح الـ state (cooldowns)',
+                style: TextStyle(
+                    fontSize: 12, decoration: TextDecoration.none)),
+            style: OutlinedButton.styleFrom(
+              foregroundColor: AppTheme.orange,
+              side: const BorderSide(color: AppTheme.orange),
               shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(10)),
             ),
@@ -845,8 +959,7 @@ class _SamuraiScreenState extends State<SamuraiScreen>
             const SizedBox(width: 8),
             Expanded(
               child: _numberField('Max Lv', '$_maxLevel', _maxLevel, (v) async {
-                setState(() => _maxLevel = v);
-                await _auto.setMaxLevel(v);
+                await _saveMaxLevel(v);
               }),
             ),
             const SizedBox(width: 8),
@@ -965,8 +1078,7 @@ class _SamuraiScreenState extends State<SamuraiScreen>
             value: _skipDaimyo,
             activeColor: Colors.green,
             onChanged: (v) async {
-              setState(() => _skipDaimyo = v);
-              await _auto.setSkipDaimyo(v);
+              await _saveSkipDaimyo(v);
             },
           ),
         ],
@@ -1434,12 +1546,15 @@ class _SamuraiScreenState extends State<SamuraiScreen>
                 onPressed: () => Navigator.pop(ctx),
                 child: const Text('إلغاء')),
             ElevatedButton(
-              onPressed: () {
+              onPressed: () async {
                 setState(() {
                   _settings.radiusTiles = temp.toInt();
-                  _settings.save();
                 });
-                Navigator.pop(ctx);
+                await _settings.save();
+                // ✅ حفظ في مفتاح background أيضًا
+                final prefs = await SharedPreferences.getInstance();
+                await prefs.setInt(kBgRadiusKey, temp.toInt());
+                if (ctx.mounted) Navigator.pop(ctx);
               },
               child: const Text('موافق'),
             ),
@@ -1520,14 +1635,17 @@ class _SamuraiScreenState extends State<SamuraiScreen>
                 onPressed: () => Navigator.pop(ctx),
                 child: const Text('إلغاء')),
             ElevatedButton(
-              onPressed: () {
+              onPressed: () async {
                 setState(() {
                   _settings.maxLevel = maxLevel;
                   _settings.skipPlayerCamps = skipPlayer;
                   _settings.includeDaimyoInScan = includeDaimyo;
-                  _settings.save();
                 });
-                Navigator.pop(ctx);
+                await _settings.save();
+                // ✅ حفظ maxLevel في مفتاح background
+                final prefs = await SharedPreferences.getInstance();
+                await prefs.setInt(kBgMaxLevelKey, maxLevel);
+                if (ctx.mounted) Navigator.pop(ctx);
               },
               child: const Text('موافق'),
             ),
@@ -1849,8 +1967,7 @@ class _SamuraiAttackSheetState extends State<_SamuraiAttackSheet> {
               margin: const EdgeInsets.only(top: 10),
               decoration: BoxDecoration(
                   color: Colors.white.withOpacity(0.2),
-                  borderRadius: BorderRadius.circular(3)),
-            ),
+                  borderRadius: BorderRadius.circular(3))),
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
               child: Row(children: [

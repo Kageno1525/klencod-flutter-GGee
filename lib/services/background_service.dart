@@ -92,6 +92,7 @@ class _GgeTaskHandler extends TaskHandler {
   Timer? _pollTimer;
   Timer? _trainTimer;
   Timer? _desertTimer;
+  Timer? _samuraiTimer;
   bool _connected = false;
   bool _loggedIn = false;
   String? _token;
@@ -141,7 +142,6 @@ class _GgeTaskHandler extends TaskHandler {
   DateTime? _samuraiLastScanAt;
   final Map<String, DateTime> _samuraiFailedCamps = {};
 
-  Timer? _samuraiTimer;
   bool _runningSamurai = false;
 
   static const int _kSamuraiCampType = 29;
@@ -1113,8 +1113,29 @@ class _GgeTaskHandler extends TaskHandler {
   }
 
   Future<void> _samuraiTick() async {
+    // ✅ Re-read config كل tick
+    final prefs = await SharedPreferences.getInstance();
+    _samuraiEnabled = prefs.getBool('samurai_auto_enabled') ?? false;
+
     if (!_loggedIn || !_samuraiEnabled) return;
-    if (_samuraiSourceAreaId == null || _samuraiSourceAreaId == 0) return;
+
+    _samuraiSourceAreaId = prefs.getInt('samurai_auto_source_area');
+    _samuraiSourceKid = prefs.getInt('samurai_auto_source_kid');
+    _samuraiRadius = prefs.getInt('samurai_radius_v1') ?? 5;
+    _samuraiMaxLevel = prefs.getInt('samurai_max_level_v1') ?? 60;
+    _samuraiSkipDaimyo = prefs.getBool('samurai_skip_daimyo_v1') ?? true;
+    _samuraiMinUnits = prefs.getInt('samurai_auto_min_units') ?? 30;
+    _samuraiWaves = prefs.getInt('samurai_auto_waves') ?? 3;
+    _samuraiToolId = prefs.getInt('samurai_auto_tool_id') ?? 166;
+    _samuraiToolL = prefs.getInt('samurai_auto_tool_l') ?? 20;
+    _samuraiToolR = prefs.getInt('samurai_auto_tool_r') ?? 20;
+    _samuraiToolM = prefs.getInt('samurai_auto_tool_m') ?? 30;
+    _samuraiMaxAttacksDay = prefs.getInt('samurai_auto_max_attacks_day') ?? 0;
+
+    if (_samuraiSourceAreaId == null || _samuraiSourceAreaId == 0) {
+      _log('Samurai: no source area');
+      return;
+    }
 
     final today = _todayStr();
     if (_samuraiAttacksDate != today) {
